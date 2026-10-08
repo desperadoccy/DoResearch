@@ -96,13 +96,17 @@ enum ProviderHarness {
         store.createProject(Project(id: "", name: "Mock Project"))
         let suite = "dr-test-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
-        let ps = ProviderStore(defaults: defaults)
-        ps.update(ProviderConfig(id: ps.providers[0].id, name: "MockAnthropic", kind: .anthropic, baseURL: base, model: "mock-claude"))
+        let ps = ProviderStore(defaults: defaults, migrateLegacy: false)
+        // Use throwaway providers only: the default one has the real "anthropic" id and Keychain entry.
+        let a2 = ps.add(from: ProviderPreset.all[0])
+        ps.update(ProviderConfig(id: a2.id, name: "MockAnthropic", kind: .anthropic, baseURL: base, model: "mock-claude"))
+        ps.remove(ps.providers[0].id == a2.id ? ps.providers[1].id : ps.providers[0].id, deletingKey: false)
         let o2 = ps.add(from: ProviderPreset.all.first { $0.id == "custom" }!)
         ps.update(ProviderConfig(id: o2.id, name: "MockOAI", kind: .openAICompatible, baseURL: base + "/v1", model: "mock-gpt"))
         let session = AgentSession(store: store, providers: ps)
-        ps.setKey("sk-mock-anthropic", for: ps.providers[0].id)
-        defer { ps.setKey("", for: ps.providers[0].id) }
+        precondition(ps.providers.allSatisfy { $0.id != "anthropic" })
+        ps.setKey("sk-mock-anthropic", for: a2.id)
+        defer { ps.setKey("", for: a2.id) }
 
         ps.activeID = o2.id
         session.send("What projects do I have?")
@@ -146,7 +150,7 @@ enum ProviderHarness {
         expect(oHeaders?["Authorization"] == nil, "no Authorization header without a key")
 
         // Persistence.
-        let reloaded = ProviderStore(defaults: defaults)
+        let reloaded = ProviderStore(defaults: defaults, migrateLegacy: false)
         expect(reloaded.providers.count == 2 && reloaded.activeID == o2.id, "providers and active choice persist")
         reloaded.select(reloaded.providers[0].id, model: "mock-claude-2")
         expect(reloaded.active?.model == "mock-claude-2" && reloaded.active?.switcherModels.first == "mock-claude-2", "select() switches provider and model")

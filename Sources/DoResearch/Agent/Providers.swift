@@ -135,14 +135,15 @@ final class ProviderStore {
     private static let listKey = "providers"
     private static let activeKey = "activeProviderID"
 
-    init(defaults: UserDefaults = .standard) {
+    /// `migrateLegacy` carries over the pre-providers Anthropic key; tests turn it off so they never touch real Keychain items.
+    init(defaults: UserDefaults = .standard, migrateLegacy: Bool = true) {
         self.defaults = defaults
         activeID = defaults.string(forKey: Self.activeKey) ?? ""
         if let data = defaults.data(forKey: Self.listKey),
            let saved = try? JSONDecoder().decode([ProviderConfig].self, from: data), !saved.isEmpty {
             providers = saved
         } else {
-            providers = [Self.migratedDefault(defaults)]
+            providers = [Self.migratedDefault(defaults, moveLegacyKey: migrateLegacy)]
             persist()
         }
         if active == nil { activeID = providers[0].id }
@@ -185,10 +186,10 @@ final class ProviderStore {
         activeID = id
     }
 
-    func remove(_ id: String) {
+    func remove(_ id: String, deletingKey: Bool = true) {
         guard providers.count > 1 else { return }
         providers.removeAll { $0.id == id }
-        Keychain.save("", account: Keychain.account(forProvider: id))
+        if deletingKey { Keychain.save("", account: Keychain.account(forProvider: id)) }
         if activeID == id { activeID = providers[0].id }
         persist()
     }
@@ -207,14 +208,14 @@ final class ProviderStore {
     }
 
     /// First launch after providers were added: carry over the old single-provider Anthropic settings.
-    private static func migratedDefault(_ defaults: UserDefaults) -> ProviderConfig {
+    private static func migratedDefault(_ defaults: UserDefaults, moveLegacyKey: Bool) -> ProviderConfig {
         let config = ProviderConfig(
             id: "anthropic", name: "Anthropic", kind: .anthropic, baseURL: "https://api.anthropic.com",
             model: defaults.string(forKey: "agentModel") ?? "claude-opus-5-5",
             models: ProviderPreset.all[0].suggestedModels,
             effort: defaults.string(forKey: "agentEffort") ?? "medium"
         )
-        if let legacy = Keychain.read(account: Keychain.legacyAccount) {
+        if moveLegacyKey, let legacy = Keychain.read(account: Keychain.legacyAccount) {
             if Keychain.save(legacy, account: Keychain.account(forProvider: config.id)) {
                 Keychain.save("", account: Keychain.legacyAccount)
             }
