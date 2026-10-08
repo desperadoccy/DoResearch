@@ -1,11 +1,15 @@
 import Foundation
 import Security
 
+/// API keys in the login Keychain, one generic-password item per provider.
 enum Keychain {
     private static let service = "DoResearch"
-    private static let account = "anthropic-api-key"
+    /// Account used before multiple providers existed; migrated to the default Anthropic provider.
+    static let legacyAccount = "anthropic-api-key"
 
-    static func readAPIKey() -> String? {
+    static func account(forProvider id: String) -> String { "provider-\(id)" }
+
+    static func read(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -21,8 +25,9 @@ enum Keychain {
         return key
     }
 
+    /// Saving an empty string deletes the item.
     @discardableResult
-    static func saveAPIKey(_ key: String) -> Bool {
+    static func save(_ key: String, account: String) -> Bool {
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -33,12 +38,5 @@ enum Keychain {
         var add = base
         add[kSecValueData as String] = Data(key.utf8)
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-    }
-
-    /// Keychain first, then the environment (handy when launching from a terminal).
-    static func resolveAPIKey() -> String? {
-        if let key = readAPIKey() { return key }
-        if let env = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"], !env.isEmpty { return env }
-        return nil
     }
 }

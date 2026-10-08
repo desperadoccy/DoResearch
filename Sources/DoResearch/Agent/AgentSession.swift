@@ -1,8 +1,9 @@
 import Foundation
 import Observation
 
-/// Drives the in-app assistant: a manual tool-use loop over the Messages API.
-/// History is append-only (assistant content is echoed back unchanged, including thinking blocks).
+/// Drives the in-app assistant: a manual tool-use loop over whichever provider is active.
+/// The transcript is provider-neutral and append-only, so switching providers mid-conversation keeps the context,
+/// and turns an Anthropic model produced are echoed back to it unchanged (thinking blocks included).
 @Observable
 @MainActor
 final class AgentSession {
@@ -19,25 +20,39 @@ final class AgentSession {
     /// Supplies a short description of what the user is looking at, attached to each message.
     @ObservationIgnored var contextProvider: (() -> String?)?
 
-    @ObservationIgnored private var messages: [[String: Any]] = []
+    @ObservationIgnored private var transcript: [ChatTurn] = []
+    @ObservationIgnored private var lastProviderID: String?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private let store: Store
+    let providers: ProviderStore
     private let maxIterations = 25
+    private let maxTokens = 16000
 
-    init(store: Store) {
+    init(store: Store, providers: ProviderStore) {
         self.store = store
+        self.providers = providers
     }
 
-    var hasAPIKey: Bool { Keychain.resolveAPIKey() != nil }
+    /// Why the active provider can't be used yet, if it can't.
+    var setupProblem: String? {
+        guard let p = providers.active else { return "Add a model provider in Settings → Providers." }
+        if p.model.trimmingCharacters(in: .whitespaces).isEmpty { return "Choose a model for \(p.name) in Settings → Providers." }
+        if p.host == "api.anthropic.com", p.apiKey == nil { return "Add an API key for \(p.name) in Settings → Providers." }
+        return nil
+    }
 
-    var model: String { UserDefaults.standard.string(forKey: "agentModel") ?? ClaudeClient.defaultModel }
-    var effort: String { UserDefaults.standard.string(forKey: "agentEffort") ?? ClaudeClient.defaultEffort }
+    /// Softer hint: hosted OpenAI-compatible services need a key, but we still let the server say so.
+    var missingKeyHint: Bool {
+        guard let p = providers.active else { return false }
+        return p.requiresKey && p.apiKey == nil
+    }
 
     func reset() {
         task?.cancel()
         task = nil
-        messages = []
+        transcript = []
         entries = []
+        lastProviderID = nil
         isRunning = false
     }
 
@@ -48,50 +63,38 @@ final class AgentSession {
     func send(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isRunning else { return }
-        guard let key = Keychain.resolveAPIKey() else {
-            entries.append(Entry(role: .error, text: "Add your Anthropic API key in Settings (⌘,) to use the assistant.", isError: true))
+        if let problem = setupProblem {
+            entries.append(Entry(role: .error, text: problem, isError: true))
             return
         }
+        let provider = providers.active!
 
-        entries.append(Entry(role: .user, text: trimmed))
-        var content: [[String: Any]] = []
-        if let context = contextProvider?() {
-            content.append(["type": "text", "text": "<app_context>\n\(context)\n</app_context>"])
+        if let last = lastProviderID, last != provider.id, !transcript.isEmpty {
+            entries.append(Entry(role: .notice, text: "Switched to \(provider.name) · \(provider.model). The conversation continues."))
         }
-        content.append(["type": "text", "text": trimmed])
-        appendUser(content)
+        entries.append(Entry(role: .user, text: trimmed))
+        var parts: [String] = []
+        if let context = contextProvider?() { parts.append("<app_context>\n\(context)\n</app_context>") }
+        parts.append(trimmed)
+        transcript.append(.user(parts))
 
-        let client = ClaudeClient(apiKey: key, model: model, effort: effort)
+        let client = makeClient(for: provider)
         isRunning = true
         task = Task { [weak self] in
-            await self?.runLoop(client)
+            await self?.runLoop(client, provider: provider)
             self?.isRunning = false
             self?.task = nil
         }
     }
 
-    /// Consecutive user turns are merged so the history always alternates.
-    private func appendUser(_ content: [[String: Any]]) {
-        if var last = messages.last, last["role"] as? String == "user", var existing = last["content"] as? [[String: Any]] {
-            existing.append(contentsOf: content)
-            last["content"] = existing
-            messages[messages.count - 1] = last
-        } else {
-            messages.append(["role": "user", "content": content])
-        }
-    }
-
-    private func runLoop(_ client: ClaudeClient) async {
+    private func runLoop(_ client: ModelClient, provider: ProviderConfig) async {
         let tools = AgentTools(store: store)
+        let specs = ToolSpec.from(anthropic: AgentTools.definitions)
         for _ in 0..<maxIterations {
-            let response: [String: Any]
+            let reply: ModelReply
             do {
-                response = try await client.createMessage(system: systemPrompt(), messages: messages, tools: AgentTools.definitions)
+                reply = try await client.send(system: systemPrompt(), turns: transcript, tools: specs, maxTokens: maxTokens)
             } catch is CancellationError {
-                dropUnansweredUserTurn()
-                entries.append(Entry(role: .notice, text: "Stopped."))
-                return
-            } catch let error as URLError where error.code == .cancelled {
                 dropUnansweredUserTurn()
                 entries.append(Entry(role: .notice, text: "Stopped."))
                 return
@@ -101,45 +104,40 @@ final class AgentSession {
                 return
             }
 
-            let stopReason = response["stop_reason"] as? String
-            let content = response["content"] as? [[String: Any]] ?? []
-
-            if stopReason == "refusal" {
-                handleRefusal()
+            if case .refusal(let explanation) = reply.stop {
+                handleRefusal(explanation)
                 return
             }
 
-            messages.append(["role": "assistant", "content": content])
+            transcript.append(.assistant(reply.turn))
+            lastProviderID = provider.id
+            if provider.kind == .anthropic, reply.model != provider.model {
+                entries.append(Entry(role: .notice, text: "Answered by \(reply.model) (fallback model)."))
+            }
+            if !reply.turn.text.isEmpty { entries.append(Entry(role: .assistant, text: reply.turn.text)) }
 
-            let text = content.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }
-                .joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { entries.append(Entry(role: .assistant, text: text)) }
-
-            let toolUses = content.filter { $0["type"] as? String == "tool_use" }
-            if toolUses.isEmpty {
-                if stopReason == "max_tokens" {
+            let calls = reply.turn.toolCalls
+            if calls.isEmpty {
+                if reply.stop == .maxTokens {
                     entries.append(Entry(role: .notice, text: "The reply hit the length limit and was cut off."))
                 }
                 return
             }
 
-            // Run every requested tool and return all results in one user message.
-            var results: [[String: Any]] = []
-            for use in toolUses {
-                let id = use["id"] as? String ?? ""
-                let name = use["name"] as? String ?? ""
-                guard stopReason != "max_tokens", let input = use["input"] as? [String: Any] else {
-                    results.append(["type": "tool_result", "tool_use_id": id, "is_error": true,
-                                    "content": "Not executed: the tool input was incomplete. Try again with a smaller request."])
+            // Run every requested tool and return all results together.
+            var results: [ToolResult] = []
+            for call in calls {
+                guard reply.stop != .maxTokens, let input = call.input else {
+                    let why = reply.stop == .maxTokens ? "the tool input was cut off" : "the arguments weren't a valid JSON object"
+                    entries.append(Entry(role: .tool, text: "\(call.name) skipped: \(why)", isError: true))
+                    results.append(ToolResult(callID: call.id, content: "Not executed: \(why). Try again.", isError: true))
                     continue
                 }
-                let outcome = tools.run(name: name, input: input)
+                let outcome = tools.run(name: call.name, input: input)
                 entries.append(Entry(role: .tool, text: outcome.summary, isError: outcome.isError))
-                var block: [String: Any] = ["type": "tool_result", "tool_use_id": id, "content": outcome.result]
-                if outcome.isError { block["is_error"] = true }
-                results.append(block)
+                results.append(ToolResult(callID: call.id, content: outcome.result, isError: outcome.isError))
             }
-            appendUser(results)
+            transcript.append(.toolResults(results))
 
             if Task.isCancelled {
                 entries.append(Entry(role: .notice, text: "Stopped."))
@@ -149,33 +147,59 @@ final class AgentSession {
         entries.append(Entry(role: .notice, text: "Stopped after \(maxIterations) steps. Send a message to continue."))
     }
 
-    /// Removes a trailing user turn that only holds the user's text (no tool results), so a retry doesn't send it twice.
+    /// Removes a trailing user message that got no answer, so a retry doesn't send it twice.
     @discardableResult
     private func dropUnansweredUserTurn() -> Bool {
-        guard messages.last?["role"] as? String == "user",
-              let content = messages.last?["content"] as? [[String: Any]],
-              content.allSatisfy({ $0["type"] as? String == "text" }) else { return false }
-        messages.removeLast()
+        guard case .user = transcript.last else { return false }
+        transcript.removeLast()
         return true
     }
 
-    /// A declined turn has no usable content. Drop the unanswered user turn when it is plain text;
+    /// A declined turn has no usable content. Drop the unanswered user message when there is one;
     /// mid-tool-loop the history can't be repaired append-only, so start over.
-    private func handleRefusal() {
+    private func handleRefusal(_ explanation: String?) {
+        let detail = explanation.map { " (\($0))" } ?? ""
         if dropUnansweredUserTurn() {
-            entries.append(Entry(role: .notice, text: "The model declined this request. Try rephrasing it."))
+            entries.append(Entry(role: .notice, text: "The model declined this request\(detail). Try rephrasing it."))
         } else {
-            messages = []
-            entries.append(Entry(role: .notice, text: "The model declined to continue. The conversation was reset; earlier messages are no longer in its context."))
+            transcript = []
+            lastProviderID = nil
+            entries.append(Entry(role: .notice, text: "The model declined to continue\(detail). The conversation was reset; earlier messages are no longer in its context."))
         }
     }
 
-    private func systemPrompt() -> [[String: Any]] {
+    private func systemPrompt() -> [String] {
         let today = Date().formatted(.dateTime.weekday(.wide).year().month(.wide).day())
-        return [
-            ["type": "text", "text": Self.instructions],
-            ["type": "text", "text": "Today is \(today). Time zone: \(TimeZone.current.identifier)."],
-        ]
+        return [Self.instructions, "Today is \(today). Time zone: \(TimeZone.current.identifier)."]
+    }
+
+    // MARK: Connection test
+
+    struct TestResult {
+        enum Level { case ok, warning, failure }
+        let level: Level
+        let message: String
+    }
+
+    /// Sends one tiny request with a single tool, checking auth, the model name, and tool-calling support.
+    static func test(_ provider: ProviderConfig) async -> TestResult {
+        let ping = ToolSpec(name: "ping", description: "Connectivity check.", schema: [
+            "type": "object", "properties": ["message": ["type": "string"]], "required": ["message"],
+        ])
+        do {
+            let reply = try await makeClient(for: provider).send(
+                system: ["You are a connectivity check."],
+                turns: [.user(["Call the ping tool with message \"ok\"."])],
+                tools: [ping], maxTokens: 2048
+            )
+            if case .refusal = reply.stop { return TestResult(level: .warning, message: "Connected, but the model declined the test request.") }
+            if reply.turn.toolCalls.contains(where: { $0.name == "ping" }) {
+                return TestResult(level: .ok, message: "Connected to \(reply.model). Tool calling works.")
+            }
+            return TestResult(level: .warning, message: "Connected to \(reply.model), but it answered without calling the tool. The assistant needs a model with tool (function) calling.")
+        } catch {
+            return TestResult(level: .failure, message: error.localizedDescription)
+        }
     }
 
     private static let instructions = """

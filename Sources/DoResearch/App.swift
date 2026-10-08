@@ -6,13 +6,16 @@ struct DoResearchApp: App {
     @State private var store: Store
     @State private var appState = AppState()
     @State private var agent: AgentSession
+    @State private var providers: ProviderStore
 
     init() {
         // Lets the bare SwiftPM binary behave like a normal app (dock icon, focus) when run outside the bundle.
         NSApplication.shared.setActivationPolicy(.regular)
         let store = Store()
         _store = State(initialValue: store)
-        _agent = State(initialValue: AgentSession(store: store))
+        let providers = ProviderStore()
+        _providers = State(initialValue: providers)
+        _agent = State(initialValue: AgentSession(store: store, providers: providers))
     }
 
     var body: some Scene {
@@ -21,10 +24,12 @@ struct DoResearchApp: App {
                 .environment(store)
                 .environment(appState)
                 .environment(agent)
+                .environment(providers)
                 .frame(minWidth: 980, minHeight: 600)
         }
         .windowToolbarStyle(.unified)
         .commands {
+            AssistantCommands(providers: providers, agent: agent, app: appState)
             CommandGroup(replacing: .newItem) {
                 Button("New Item") { appState.requestNewItem() }
                     .keyboardShortcut("n")
@@ -48,15 +53,12 @@ struct DoResearchApp: App {
                 Button("Experiments") { appState.selection = .kind(.experiment) }.keyboardShortcut("6")
                 Button("Writing") { appState.selection = .kind(.writing) }.keyboardShortcut("7")
             }
-            CommandGroup(after: .sidebar) {
-                Button(appState.showAgent ? "Hide Assistant" : "Show Assistant") { appState.showAgent.toggle() }
-                    .keyboardShortcut("j")
-            }
         }
 
         Settings {
             SettingsView()
                 .environment(agent)
+                .environment(providers)
         }
     }
 }

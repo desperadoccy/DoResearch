@@ -55,16 +55,14 @@ struct AgentChatView: View {
             Label("Assistant", systemImage: "sparkles")
                 .font(.headline)
             Spacer()
-            Text(ClaudeClient.models.first { $0.id == agent.model }?.name ?? agent.model)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            ProviderSwitcher()
             Button {
                 agent.reset()
             } label: {
                 Image(systemName: "square.and.pencil")
             }
             .buttonStyle(.borderless)
-            .help("New conversation")
+            .help("New conversation (⇧⌘J)")
             .disabled(agent.entries.isEmpty && !agent.isRunning)
         }
         .padding(.horizontal, 12)
@@ -76,10 +74,10 @@ struct AgentChatView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Ask me to capture, organize, update, or review your work. I can create items and projects, log experiment results, update coding progress, and summarize where things stand.")
                 .foregroundStyle(.secondary)
-            if !agent.hasAPIKey {
+            if let problem = agent.setupProblem ?? (agent.missingKeyHint ? "\(agent.providers.active?.name ?? "This provider") usually needs an API key." : nil) {
                 HStack {
                     Image(systemName: "key").foregroundStyle(.orange)
-                    Text("Add your Anthropic API key to get started.")
+                    Text(problem)
                     SettingsLink { Text("Open Settings…") }
                 }
                 .font(.callout)

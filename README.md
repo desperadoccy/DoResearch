@@ -40,9 +40,18 @@ Headless checks for the data layer and agent tools:
 
 ## Assistant
 
-Open with ⌘J. Add an Anthropic API key in Settings (⌘,) — it's stored in your login Keychain (or set `ANTHROPIC_API_KEY` in the environment). Model and effort are configurable; the default is Claude Opus 5.5 at medium effort.
+Open with ⌘J. The assistant works through tools that read and modify the same database the UI uses: list/get/create/update items, edit checklists, log progress, manage projects, and produce a review summary. It sees which list and items you're looking at, so "log that this run finished with ppl 18.9" applies to the selected experiment. It can mark items *dropped* but cannot delete them.
 
-The assistant works through tools that read and modify the same database the UI uses: list/get/create/update items, edit checklists, log progress, manage projects, and produce a review summary. It sees which list and item you're looking at, so "log that this run finished with ppl 18.9" applies to the selected experiment. It can mark items *dropped* but cannot delete them.
+### Model providers
+
+Configure providers in **Settings → Providers** (⌘,). Two API styles are supported:
+
+- **Anthropic Messages API** — Claude models (default: Claude Opus 5.5, medium effort), or an Anthropic-compatible gateway.
+- **OpenAI-compatible Chat Completions** — OpenAI, OpenRouter, DeepSeek, Ollama, LM Studio, vLLM, llama.cpp, or any server exposing `/v1/chat/completions` with function calling.
+
+Add one from a preset with **+**, set its base URL, key, and model (the ↻ button loads the server's model list), then **Test Connection** — it checks auth, the model name, and that the model can call tools, which the assistant needs. API keys are stored per provider in your login Keychain; local servers can run without one. `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the environment are used as fallbacks.
+
+**Switching:** use the menu in the assistant panel's header (providers with several *Quick Switch Models* show them as a submenu), the **Assistant** menu, or **⌃⌘1–9**. Switching keeps the conversation: the transcript is stored in a provider-neutral form and translated for whichever API answers next.
 
 ## Shortcuts
 
@@ -53,6 +62,8 @@ The assistant works through tools that read and modify the same database the UI 
 | ⌘1 – ⌘4 | Today, Inbox, Upcoming, Review |
 | ⌘5 – ⌘7 | Coding, Experiments, Writing |
 | ⌘J | Toggle assistant |
+| ⇧⌘J | New assistant conversation |
+| ⌃⌘1 – ⌃⌘9 | Switch model provider |
 | ⌘C / ⌘X / ⌘V | Copy / cut / paste items |
 | ⌘D | Duplicate |
 | ⌫ | Mark selected items dropped |

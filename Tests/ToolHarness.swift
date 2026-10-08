@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct ToolHarness {
-    @MainActor static func main() {
+    @MainActor static func main() async {
         let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("dr-harness-\(UUID().uuidString).sqlite")
         let store = Store(url: url)
         let tools = AgentTools(store: store)
@@ -168,6 +168,8 @@ struct ToolHarness {
         let migrated = Store(url: url3)
         expect(migrated.items(for: .all, order: .manual).map(\.id) == ["high", "mid", "low"], "v1 → v2 keeps priority order as manual order")
         try? FileManager.default.removeItem(at: url3)
+
+        await ProviderHarness.run(expect: expect)
 
         print(failures == 0 ? "\nAll checks passed." : "\n\(failures) check(s) failed.")
         exit(failures == 0 ? 0 : 1)
