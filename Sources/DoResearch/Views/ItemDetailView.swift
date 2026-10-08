@@ -271,6 +271,7 @@ struct ItemDetailView: View {
                             set: { var e = entry; e.title = $0; store.updateChecklistEntry(e) }
                         ))
                         .textFieldStyle(.plain)
+                        .labelsHidden()
                         .strikethrough(entry.done)
                         .foregroundStyle(entry.done ? .secondary : .primary)
                     }

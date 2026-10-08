@@ -5,6 +5,7 @@ struct SidebarView: View {
     @Environment(AppState.self) private var app
     @State private var editingProject: Project?
     @State private var deletingProject: Project?
+    @State private var dropTarget: SidebarSelection?
 
     var body: some View {
         @Bindable var app = app
@@ -59,6 +60,9 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        .onPasteCommand(of: ItemActions.dropTypes) { _ in
+            ItemActions(store: store, app: app).paste()
+        }
         .sheet(item: $editingProject) { ProjectEditor(project: $0) }
         .confirmationDialog(
             "Delete “\(deletingProject?.name ?? "")”?",
@@ -83,6 +87,7 @@ struct SidebarView: View {
         }
         .badge(count > 0 ? count : 0)
         .tag(selection)
+        .modifier(SidebarDropTarget(selection: selection, target: $dropTarget))
     }
 
     private func projectRow(_ project: Project) -> some View {
@@ -95,6 +100,7 @@ struct SidebarView: View {
         }
         .badge(count)
         .tag(SidebarSelection.project(project.id))
+        .modifier(SidebarDropTarget(selection: .project(project.id), target: $dropTarget))
         .contextMenu {
             Button("Edit Project…") { editingProject = project }
             Menu("Status") {
@@ -108,6 +114,32 @@ struct SidebarView: View {
             }
             Divider()
             Button("Delete Project…", role: .destructive) { deletingProject = project }
+        }
+    }
+}
+
+/// Lets items be dragged onto a sidebar list: onto a project to file them there, a kind to change their kind,
+/// Today to flag them, Inbox to untriage, Logbook to complete. Hold Option to copy instead of move.
+private struct SidebarDropTarget: ViewModifier {
+    let selection: SidebarSelection
+    @Binding var target: SidebarSelection?
+    @Environment(Store.self) private var store
+    @Environment(AppState.self) private var app
+
+    func body(content: Content) -> some View {
+        if selection.acceptsDrops {
+            content
+                .onDrop(of: ItemActions.dropTypes, isTargeted: Binding(
+                    get: { target == selection },
+                    set: { target = $0 ? selection : (target == selection ? nil : target) }
+                )) { providers in
+                    ItemActions(store: store, app: app).drop(providers, placement: selection.placement, select: false)
+                }
+                .listRowBackground(
+                    target == selection ? RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.25)).padding(.horizontal, 10) : nil
+                )
+        } else {
+            content
         }
     }
 }

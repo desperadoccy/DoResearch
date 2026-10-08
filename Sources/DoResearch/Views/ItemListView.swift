@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum ListLayout: String, CaseIterable {
@@ -10,6 +11,7 @@ struct ItemListView: View {
     @Environment(Store.self) private var store
     @Environment(AppState.self) private var app
     @AppStorage("listLayout") private var layout: ListLayout = .list
+    @AppStorage("sortOrder") private var sortOrder: SortOrder = .manual
     @State private var newTitle = ""
     @State private var showDone = true
     @FocusState private var quickAddFocused: Bool
@@ -23,7 +25,8 @@ struct ItemListView: View {
 
     var body: some View {
         @Bindable var app = app
-        let items = store.items(for: selection, search: app.search)
+        let items = store.items(for: selection, search: app.search, order: sortOrder)
+        let manual = sortOrder == .manual && selection.supportsManualOrder
 
         VStack(spacing: 0) {
             if case .project(let id) = selection, let project = store.project(id) {
@@ -33,18 +36,19 @@ struct ItemListView: View {
             quickAdd
             Divider()
             if supportsBoard && layout == .board {
-                BoardView(items: items, kind: kindContext)
-            } else if items.isEmpty {
-                ContentUnavailableView(emptyTitle, systemImage: emptySymbol, description: Text(emptyMessage))
-                    .frame(maxHeight: .infinity)
+                BoardView(items: items, kind: kindContext, listPlacement: selection.placement, manual: manual)
             } else {
-                List(selection: $app.selectedItemID) {
+                List(selection: $app.selectedItemIDs) {
                     ForEach(sections(items), id: \.title) { section in
                         Section {
-                            ForEach(section.items) { item in
-                                ItemRow(item: item, showProject: !isProjectView)
-                                    .tag(item.id)
-                                    .contextMenu { ItemContextMenu(item: item) }
+                            if let placement = section.placement {
+                                rows(section, visible: items)
+                                    .onInsert(of: ItemActions.dropTypes) { offset, providers in
+                                        actions.drop(providers, placement: selection.placement.merged(with: placement),
+                                                     insertAt: offset, in: manual ? section.items : nil)
+                                    }
+                            } else {
+                                rows(section, visible: items)
                             }
                         } header: {
                             HStack {
@@ -55,8 +59,19 @@ struct ItemListView: View {
                     }
                 }
                 .listStyle(.inset(alternatesRowBackgrounds: false))
-                .onDeleteCommand {
-                    if let id = app.selectedItemID { store.setStatus(.dropped, for: id) }
+                .contextMenu(forSelectionType: String.self) { ids in
+                    ItemContextMenu(ids: ids)
+                }
+                .modifier(ItemCommands())
+                .overlay {
+                    if items.isEmpty {
+                        ContentUnavailableView(emptyTitle, systemImage: emptySymbol, description: Text(emptyMessage))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .background(.background)
+                            .onDrop(of: ItemActions.dropTypes, isTargeted: nil) { providers in
+                                selection.acceptsDrops && actions.drop(providers, placement: selection.placement)
+                            }
+                    }
                 }
             }
         }
@@ -73,6 +88,19 @@ struct ItemListView: View {
                     .help("Switch between list and board")
                 }
             }
+            if selection.supportsManualOrder {
+                ToolbarItem {
+                    Menu {
+                        Picker("Sort By", selection: $sortOrder) {
+                            ForEach(SortOrder.allCases) { Text($0.label).tag($0) }
+                        }
+                        .pickerStyle(.inline)
+                    } label: {
+                        Label("Sort", systemImage: "arrow.up.arrow.down")
+                    }
+                    .help(sortOrder == .manual ? "Sorted manually: drag items to rearrange" : "Sorted by \(sortOrder.label.lowercased())")
+                }
+            }
             ToolbarItem {
                 Toggle(isOn: $showDone) {
                     Label("Show Completed", systemImage: "checkmark.circle")
@@ -81,6 +109,20 @@ struct ItemListView: View {
             }
         }
         .onChange(of: app.newItemRequest) { quickAddFocused = true }
+    }
+
+    private var actions: ItemActions { ItemActions(store: store, app: app) }
+
+    private func rows(_ section: ItemSection, visible: [Item]) -> some DynamicViewContent {
+        let actions = actions
+        let cutActive = actions.hasPendingCut
+        return ForEach(section.items) { item in
+            let payload = actions.dragPayload(for: item, in: visible)
+            ItemRow(item: item, showProject: !isProjectView)
+                .opacity(cutActive && app.cutIDs.contains(item.id) ? 0.45 : 1)
+                .tag(item.id)
+                .draggable(payload) { DragPreview(transfer: payload) }
+        }
     }
 
     // MARK: Quick add
@@ -120,6 +162,11 @@ struct ItemListView: View {
         default: break
         }
         let created = store.createItem(draft)
+        if sortOrder == .manual, selection.supportsManualOrder {
+            // New items go to the top of the list they were typed into.
+            let list = store.items(for: selection, order: .manual)
+            store.reorder([created.id], before: list.first { $0.id != created.id }?.id, within: list)
+        }
         app.selectedItemID = created.id
         newTitle = ""
     }
@@ -129,6 +176,8 @@ struct ItemListView: View {
     struct ItemSection {
         let title: String
         let items: [Item]
+        /// What an item dropped into this section becomes; nil for date-ordered sections that don't accept drops.
+        var placement: Placement? = nil
     }
 
     private var isProjectView: Bool { if case .project = selection { true } else { false } }
@@ -141,10 +190,11 @@ struct ItemListView: View {
         case .today:
             let focus = visible.filter { $0.flaggedToday || $0.isDueTodayOrEarlier }
             let rest = visible.filter { !($0.flaggedToday || $0.isDueTodayOrEarlier) }
-            return [ItemSection(title: "Today", items: focus), ItemSection(title: "In Progress", items: rest)]
+            return [ItemSection(title: "Today", items: focus, placement: Placement(today: true)),
+                    ItemSection(title: "In Progress", items: rest, placement: Placement(status: .inProgress, today: false))]
                 .filter { !$0.items.isEmpty }
         case .inbox:
-            return [ItemSection(title: "Unprocessed", items: visible)]
+            return [ItemSection(title: "Unprocessed", items: visible, placement: Placement(status: .inbox))]
         case .upcoming:
             return group(visible) { $0.dueDate.map { $0.formatted(.dateTime.weekday(.wide).month().day()) } ?? "" }
         case .logbook:
@@ -155,7 +205,7 @@ struct ItemListView: View {
                 let matching = visible.filter { $0.status == status }
                 guard !matching.isEmpty else { return nil }
                 let title = kindContext.map { status.label(for: $0) } ?? status.genericLabel
-                return ItemSection(title: title, items: matching)
+                return ItemSection(title: title, items: matching, placement: Placement(status: status))
             }
         }
     }
@@ -328,57 +378,20 @@ struct KindBadge: View {
     }
 }
 
-struct ItemContextMenu: View {
-    let item: Item
-    @Environment(Store.self) private var store
-    @Environment(AppState.self) private var app
-
-    var body: some View {
-        Menu("Status") {
-            ForEach(ItemStatus.allCases) { status in
-                Button(status.label(for: item.kind)) { store.setStatus(status, for: item.id) }
-            }
-        }
-        Menu("Kind") {
-            ForEach(ItemKind.allCases) { kind in
-                Button(kind.label) { mutate { $0.kind = kind } }
-            }
-        }
-        Menu("Project") {
-            Button("None") { mutate { $0.projectID = nil } }
-            Divider()
-            ForEach(store.activeProjects) { p in
-                Button(p.name) { mutate { $0.projectID = p.id } }
-            }
-        }
-        Button(item.flaggedToday ? "Remove from Today" : "Add to Today") { mutate { $0.flaggedToday.toggle() } }
-        Divider()
-        Button("Ask Assistant About This") {
-            app.selectedItemID = item.id
-            app.showAgent = true
-        }
-        Divider()
-        Button("Delete", role: .destructive) {
-            if app.selectedItemID == item.id { app.selectedItemID = nil }
-            store.deleteItem(item.id)
-        }
-    }
-
-    private func mutate(_ change: (inout Item) -> Void) {
-        var copy = item
-        change(&copy)
-        store.updateItem(copy)
-    }
-}
-
 // MARK: - Board
 
 struct BoardView: View {
     let items: [Item]
     let kind: ItemKind?
+    let listPlacement: Placement
+    let manual: Bool
     @Environment(Store.self) private var store
     @Environment(AppState.self) private var app
-    @State private var targeted: ItemStatus?
+    @State private var targetedColumn: ItemStatus?
+    @State private var targetedCard: String?
+    @FocusState private var focused: Bool
+
+    private var actions: ItemActions { ItemActions(store: store, app: app) }
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -390,6 +403,16 @@ struct BoardView: View {
             .padding(12)
         }
         .background(.background.secondary)
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .modifier(ItemCommands())
+    }
+
+    /// A Bool binding that is true while `state` equals `value`, for drop-target highlighting.
+    private func target<T: Equatable>(_ state: Binding<T?>, _ value: T) -> Binding<Bool> {
+        Binding(get: { state.wrappedValue == value },
+                set: { state.wrappedValue = $0 ? value : (state.wrappedValue == value ? nil : state.wrappedValue) })
     }
 
     private var columns: [ItemStatus] {
@@ -409,7 +432,7 @@ struct BoardView: View {
             ScrollView {
                 LazyVStack(spacing: 8) {
                     ForEach(cards) { item in
-                        card(item)
+                        card(item, column: cards, status: status)
                     }
                 }
                 .padding(2)
@@ -421,16 +444,20 @@ struct BoardView: View {
         .background(.background, in: RoundedRectangle(cornerRadius: 10))
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(targeted == status ? Color.accentColor : Color.primary.opacity(0.08), lineWidth: targeted == status ? 2 : 1)
+                .strokeBorder(targetedColumn == status ? Color.accentColor : Color.primary.opacity(0.08),
+                              lineWidth: targetedColumn == status ? 2 : 1)
         )
-        .dropDestination(for: String.self) { ids, _ in
-            for id in ids { store.setStatus(status, for: id) }
-            return true
-        } isTargeted: { targeted = $0 ? status : (targeted == status ? nil : targeted) }
+        // Dropping on the column (not on a card) appends to its end.
+        .onDrop(of: ItemActions.dropTypes, isTargeted: target($targetedColumn, status)) { providers in
+            actions.drop(providers, placement: listPlacement.merged(with: Placement(status: status)),
+                         insertAt: cards.count, in: manual ? cards : nil)
+        }
     }
 
-    private func card(_ item: Item) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private func card(_ item: Item, column cards: [Item], status: ItemStatus) -> some View {
+        let payload = actions.dragPayload(for: item, in: items)
+        let selected = app.selectedItemIDs.contains(item.id)
+        return VStack(alignment: .leading, spacing: 6) {
             Text(item.title).font(.body).lineLimit(3)
             HStack(spacing: 6) {
                 KindBadge(kind: item.kind)
@@ -454,11 +481,31 @@ struct BoardView: View {
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(app.selectedItemID == item.id ? Color.accentColor : .clear, lineWidth: 2)
+                .strokeBorder(selected ? Color.accentColor : .clear, lineWidth: 2)
         )
+        .overlay(alignment: .top) {
+            // Insertion marker: the dropped cards land above this one.
+            if targetedCard == item.id {
+                Capsule().fill(Color.accentColor).frame(height: 3).offset(y: -5.5)
+            }
+        }
+        .opacity(actions.hasPendingCut && app.cutIDs.contains(item.id) ? 0.45 : 1)
         .contentShape(Rectangle())
-        .onTapGesture { app.selectedItemID = item.id }
-        .draggable(item.id)
-        .contextMenu { ItemContextMenu(item: item) }
+        .onTapGesture {
+            focused = true
+            if NSEvent.modifierFlags.contains(.command) {
+                if selected { app.selectedItemIDs.remove(item.id) } else { app.selectedItemIDs.insert(item.id) }
+            } else {
+                app.selectedItemID = item.id
+            }
+        }
+        .draggable(payload) { DragPreview(transfer: payload) }
+        .onDrop(of: ItemActions.dropTypes, isTargeted: target($targetedCard, item.id)) { providers in
+            actions.drop(providers, placement: listPlacement.merged(with: Placement(status: status)),
+                         insertAt: cards.firstIndex { $0.id == item.id }, in: manual ? cards : nil)
+        }
+        .contextMenu {
+            ItemContextMenu(ids: selected ? app.selectedItemIDs : [item.id])
+        }
     }
 }

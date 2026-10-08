@@ -28,6 +28,16 @@ Headless checks for the data layer and agent tools:
 - **Progress log**: every status change and note is timestamped per item; changes made by the assistant are marked as such.
 - **Review** dashboard (⌘4): completed/added counts, experiments by phase, active coding, blocked/overdue/stale work, per-project progress, and an activity timeline over 7/14/30 days.
 
+## Moving, copying, and rearranging
+
+- **Rearrange** by dragging items within a list or board column. Order is kept per item and shared by all lists; use the toolbar's Sort menu to switch between Manual, Priority, Due Date, and Title (dragging sets the order only in Manual). Upcoming and Logbook are always ordered by date.
+- **Drag between sections** to change status: dropping into *Running*, *In Review*, *Blocked*, etc. (or onto a board column) updates the status, and experiment run times are stamped as usual.
+- **Drag onto the sidebar** to file items: a project assigns it, a kind (Coding, Experiments, …) changes its kind, Today flags it, Inbox untriages it, Logbook completes it.
+- **Hold ⌥ while dropping** to copy instead of move.
+- **Select several** items with ⌘-click or ⇧-click; drags, the context menu, and the clipboard act on all of them.
+- **⌘C / ⌘X / ⌘V**: copy and paste duplicate items into the current list (after the selection). Cut doesn't remove anything: the items fade, and the next paste moves them, keeping their history. Esc cancels a cut. Copied items paste into other apps as a Markdown checklist, and pasting or dropping plain text into a list creates one item per line (bullets, numbers, and `[x]` are understood).
+- **⌘D** duplicates the selection in place. Copies get a fresh progress log.
+
 ## Assistant
 
 Open with ⌘J. Add an Anthropic API key in Settings (⌘,) — it's stored in your login Keychain (or set `ANTHROPIC_API_KEY` in the environment). Model and effort are configurable; the default is Claude Opus 5.5 at medium effort.
@@ -43,7 +53,10 @@ The assistant works through tools that read and modify the same database the UI 
 | ⌘1 – ⌘4 | Today, Inbox, Upcoming, Review |
 | ⌘5 – ⌘7 | Coding, Experiments, Writing |
 | ⌘J | Toggle assistant |
-| ⌫ | Drop selected item |
+| ⌘C / ⌘X / ⌘V | Copy / cut / paste items |
+| ⌘D | Duplicate |
+| ⌫ | Mark selected items dropped |
+| Esc | Cancel a pending cut |
 
 ## Data
 

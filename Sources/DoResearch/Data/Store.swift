@@ -21,6 +21,11 @@ final class Store {
             fatalError("Failed to open database: \(error.localizedDescription)")
         }
         reload()
+        if db.didAddPositions {
+            // Keep lists looking exactly as they did before manual ordering existed.
+            let ordered = items.sorted(by: Self.sortKey)
+            setPositions(Dictionary(uniqueKeysWithValues: ordered.enumerated().map { ($1.id, Double($0)) }))
+        }
     }
 
     func reload() {
@@ -63,29 +68,36 @@ final class Store {
 
     // MARK: Items
 
+    /// Inserts a new item at the top of the manual order. Checklist steps come from `checklist` if given,
+    /// otherwise from `draft.checklist` (keeping their done state, as when duplicating).
     @discardableResult
-    func createItem(_ draft: Item, checklist: [String] = [], author: Author = .user) -> Item {
+    func createItem(_ draft: Item, checklist: [String] = [], author: Author = .user, logText: String? = nil) -> Item {
         var item = draft
         if item.id.isEmpty || self.item(item.id) != nil { item.id = uniqueItemID() }
         let now = Date()
         item.createdAt = now
         item.updatedAt = now
-        if !item.status.isOpen { item.completedAt = now }
+        item.position = (items.map(\.position).min() ?? 0) - 1
+        if !item.status.isOpen, item.completedAt == nil { item.completedAt = now }
+        if item.status.isOpen { item.completedAt = nil }
         if item.kind == .experiment, item.status == .inProgress, item.runStartedAt == nil { item.runStartedAt = now }
+        let steps = checklist.isEmpty ? draft.checklist.map { ($0.title, $0.done) } : checklist.map { ($0, false) }
+        item.checklist = []
         do {
             try db.transaction {
                 try db.execute(
                     "INSERT INTO items (\(Self.itemColumns.joined(separator: ","))) VALUES (\(Self.placeholders(Self.itemColumns.count)))",
                     Self.itemParams(item)
                 )
-                for (i, title) in checklist.enumerated() {
-                    let entry = ChecklistEntry(id: ShortID.make(10), itemID: item.id, title: title, done: false, position: i)
+                for (i, step) in steps.enumerated() {
+                    let entry = ChecklistEntry(id: ShortID.make(10), itemID: item.id, title: step.0, done: step.1, position: i)
                     try insertChecklist(entry)
                     item.checklist.append(entry)
                 }
             }
             items.append(item)
-            log(item: item.id, project: item.projectID, kind: "created", text: "Created \(item.kind.label.lowercased()) “\(item.title)”", author: author)
+            log(item: item.id, project: item.projectID, kind: "created",
+                text: logText ?? "Created \(item.kind.label.lowercased()) “\(item.title)”", author: author)
         } catch {
             report(error)
         }
@@ -96,10 +108,14 @@ final class Store {
     func updateItem(_ updated: Item, author: Author = .user) {
         guard let index = items.firstIndex(where: { $0.id == updated.id }) else { return }
         let old = items[index]
-        guard old != updated else { return }
         var item = updated
+        item.position = old.position // ordering changes only through reorder(), so stale copies can't undo a drag
+        guard old != item else { return }
         item.updatedAt = Date()
 
+        if old.kind != .experiment, item.kind == .experiment, item.status == .inProgress, item.runStartedAt == nil {
+            item.runStartedAt = Date()
+        }
         if old.status != item.status {
             let now = Date()
             item.completedAt = item.status.isOpen ? nil : (item.completedAt ?? now)
@@ -154,6 +170,108 @@ final class Store {
         var id = ShortID.make()
         while item(id) != nil { id = ShortID.make() }
         return id
+    }
+
+    // MARK: Ordering, moving, copying
+
+    /// Writes positions without touching `updatedAt`: reordering isn't progress, and shouldn't hide stale work.
+    func setPositions(_ positions: [String: Double]) {
+        guard !positions.isEmpty else { return }
+        do {
+            try db.transaction {
+                for (id, position) in positions {
+                    try db.execute("UPDATE items SET position = ? WHERE id = ?", [position, id])
+                }
+            }
+            for i in items.indices {
+                if let p = positions[items[i].id] { items[i].position = p }
+            }
+        } catch {
+            report(error)
+        }
+    }
+
+    /// Moves `ids` (in this order) so they sit just before `anchorID` in `visible`, or at its end when nil.
+    /// `visible` is the list as the user sees it; positions are global, so hidden items keep their relative order.
+    func reorder(_ ids: [String], before anchorID: String?, within visible: [Item]) {
+        let moving = Set(ids)
+        let ids = ids.filter { item($0) != nil }
+        guard !ids.isEmpty else { return }
+        let current = visible.compactMap { item($0.id) }.filter { !moving.contains($0.id) }
+        let others = items.filter { !moving.contains($0.id) }.map(\.position).sorted()
+        let insertAt = anchorID.flatMap { a in current.firstIndex { $0.id == a } } ?? current.count
+        let prev = insertAt > 0 ? current[insertAt - 1].position : nil
+        let next = insertAt < current.count ? current[insertAt].position : nil
+        let gap = Double(ids.count + 1)
+
+        // Land directly after the visible predecessor (or before the visible successor) in the global order.
+        var lo: Double, hi: Double
+        if let prev {
+            lo = prev
+            hi = others.first { $0 > prev } ?? prev + gap
+            if let next, next > prev, next < hi { hi = next }
+        } else if let next {
+            hi = next
+            lo = others.last { $0 < next } ?? next - gap
+        } else {
+            hi = others.first ?? 0
+            lo = hi - gap
+        }
+        let step = (hi - lo) / gap
+        guard step > 1e-6 else {
+            renumberPositions()
+            reorder(ids, before: anchorID, within: visible)
+            return
+        }
+        setPositions(Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, lo + step * Double($0 + 1)) }))
+    }
+
+    private func renumberPositions() {
+        let ordered = items.sorted(by: Self.manualOrder)
+        setPositions(Dictionary(uniqueKeysWithValues: ordered.enumerated().map { ($1.id, Double($0)) }))
+    }
+
+    /// Lands `incoming` in a list: existing items are moved (or duplicated when `copy`), items not in the store
+    /// (pasted text, snapshots of deleted items) are created. Returns the ids of the items now in place.
+    @discardableResult
+    func place(_ incoming: [Item], copy: Bool, placement: Placement,
+               before anchorID: String?, within visible: [Item]?) -> [String] {
+        var placed: [String] = []
+        for source in incoming {
+            if !copy, var existing = item(source.id) {
+                placement.apply(to: &existing)
+                updateItem(existing)
+                placed.append(existing.id)
+            } else {
+                let live = item(source.id)
+                var draft = live ?? source
+                draft.id = ""
+                placement.apply(to: &draft)
+                let created = createItem(draft, logText: live.map { "Copied from “\($0.title)”" })
+                placed.append(created.id)
+            }
+        }
+        if let visible { reorder(placed, before: anchorID, within: visible) }
+        return placed
+    }
+
+    /// Copies each item and puts the copy right after its original.
+    @discardableResult
+    func duplicate(_ ids: [String]) -> [String] {
+        var created: [String] = []
+        for id in ids {
+            guard let original = item(id) else { continue }
+            var draft = original
+            draft.id = ""
+            let copy = createItem(draft, logText: "Duplicated from “\(original.title)”")
+            let ordered = items.sorted(by: Self.manualOrder)
+            let successor = ordered.firstIndex { $0.id == id }.flatMap { i in
+                ordered[(i + 1)...].first { $0.id != copy.id }?.id
+            }
+            reorder([copy.id], before: successor, within: ordered)
+            created.append(copy.id)
+        }
+        return created
     }
 
     // MARK: Checklist
@@ -310,7 +428,7 @@ final class Store {
     private static let itemColumns = [
         "id", "title", "notes", "kind", "status", "priority", "project_id", "tags", "due_date", "flagged_today",
         "created_at", "updated_at", "completed_at", "repo", "branch", "link", "hypothesis", "setup", "compute",
-        "results", "conclusion", "outcome", "metrics", "run_started_at", "run_ended_at",
+        "results", "conclusion", "outcome", "metrics", "run_started_at", "run_ended_at", "position",
     ]
 
     private static func placeholders(_ n: Int) -> String { Array(repeating: "?", count: n).joined(separator: ",") }
@@ -322,7 +440,8 @@ final class Store {
     private static func itemParams(_ i: Item) -> [SQLConvertible] {
         [i.id, i.title, i.notes, i.kind.rawValue, i.status.rawValue, i.priority.rawValue, i.projectID, json(i.tags),
          i.dueDate, i.flaggedToday, i.createdAt, i.updatedAt, i.completedAt, i.repo, i.branch, i.link, i.hypothesis,
-         i.setup, i.compute, i.results, i.conclusion, i.outcome.rawValue, json(i.metrics), i.runStartedAt, i.runEndedAt]
+         i.setup, i.compute, i.results, i.conclusion, i.outcome.rawValue, json(i.metrics), i.runStartedAt, i.runEndedAt,
+         i.position]
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, _ s: String?, default value: T) -> T {
@@ -345,6 +464,7 @@ final class Store {
             createdAt: r["created_at"]?.date ?? Date(),
             updatedAt: r["updated_at"]?.date ?? Date(),
             completedAt: r["completed_at"]?.date,
+            position: r["position"]?.double ?? 0,
             repo: r["repo"]?.string ?? "",
             branch: r["branch"]?.string ?? "",
             link: r["link"]?.string ?? "",
@@ -397,6 +517,34 @@ enum SidebarSelection: Hashable {
     case today, inbox, upcoming, all, review, logbook
     case kind(ItemKind)
     case project(String)
+
+    /// How an item changes when dropped or pasted onto this list.
+    var placement: Placement {
+        switch self {
+        case .today: Placement(today: true)
+        case .inbox: Placement(status: .inbox)
+        case .kind(let k): Placement(kind: k)
+        case .project(let id): Placement(projectID: id)
+        case .logbook: Placement(status: .done)
+        case .upcoming, .all, .review: Placement()
+        }
+    }
+
+    /// Upcoming and Logbook are ordered by date, so they can't be rearranged by hand.
+    var supportsManualOrder: Bool {
+        switch self {
+        case .upcoming, .logbook, .review: false
+        default: true
+        }
+    }
+
+    /// Lists that accept items dragged onto them in the sidebar.
+    var acceptsDrops: Bool {
+        switch self {
+        case .upcoming, .all, .review: false
+        default: true
+        }
+    }
 }
 
 extension Store {
@@ -410,7 +558,30 @@ extension Store {
         }
     }
 
-    func items(for selection: SidebarSelection, search: String = "") -> [Item] {
+    static func manualOrder(_ a: Item, _ b: Item) -> Bool {
+        a.position != b.position ? a.position < b.position : a.createdAt > b.createdAt
+    }
+
+    static func comparator(_ order: SortOrder) -> (Item, Item) -> Bool {
+        switch order {
+        case .manual: manualOrder
+        case .priority: sortKey
+        case .dueDate: { a, b in
+            switch (a.dueDate, b.dueDate) {
+            case let (x?, y?) where x != y: x < y
+            case (_?, nil): true
+            case (nil, _?): false
+            default: manualOrder(a, b)
+            }
+        }
+        case .title: { a, b in
+            let r = a.title.localizedStandardCompare(b.title)
+            return r == .orderedSame ? manualOrder(a, b) : r == .orderedAscending
+        }
+        }
+    }
+
+    func items(for selection: SidebarSelection, search: String = "", order: SortOrder = .priority) -> [Item] {
         var result: [Item]
         switch selection {
         case .today:
@@ -435,7 +606,7 @@ extension Store {
         case .project(let id):
             result = items.filter { $0.projectID == id && $0.status != .dropped }
         }
-        return filtered(result.sorted(by: Self.sortKey), search)
+        return filtered(result.sorted(by: Self.comparator(order)), search)
     }
 
     private func filtered(_ list: [Item], _ search: String) -> [Item] {

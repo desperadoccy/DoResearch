@@ -15,6 +15,13 @@ enum SQLValue: Equatable {
         default: nil
         }
     }
+    var double: Double? {
+        switch self {
+        case .double(let v): v
+        case .int(let v): Double(v)
+        default: nil
+        }
+    }
     var date: Date? {
         switch self {
         case .double(let v): Date(timeIntervalSince1970: v)
@@ -44,6 +51,8 @@ struct DatabaseError: LocalizedError {
 /// Minimal synchronous SQLite wrapper. All access happens on the main actor via `Store`.
 final class Database {
     private var handle: OpaquePointer?
+    /// True when this launch added `items.position`; the store then seeds it from the previous automatic order.
+    private(set) var didAddPositions = false
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     init(url: URL) throws {
@@ -202,6 +211,14 @@ final class Database {
                 try execute("CREATE INDEX idx_logs_created ON logs(created_at)")
                 try execute("PRAGMA user_version = 1")
             }
+        }
+        if version < 2 {
+            try transaction {
+                try execute("ALTER TABLE items ADD COLUMN position REAL NOT NULL DEFAULT 0")
+                try execute("CREATE INDEX idx_items_position ON items(position)")
+                try execute("PRAGMA user_version = 2")
+            }
+            didAddPositions = true
         }
     }
 }

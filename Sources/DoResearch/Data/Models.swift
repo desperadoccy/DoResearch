@@ -175,7 +175,7 @@ struct Metric: Codable, Hashable, Identifiable {
     enum CodingKeys: String, CodingKey { case name, value }
 }
 
-struct ChecklistEntry: Identifiable, Hashable {
+struct ChecklistEntry: Identifiable, Hashable, Codable {
     var id: String
     var itemID: String
     var title: String
@@ -183,7 +183,7 @@ struct ChecklistEntry: Identifiable, Hashable {
     var position: Int
 }
 
-struct Item: Identifiable, Hashable {
+struct Item: Identifiable, Hashable, Codable {
     var id: String
     var title: String
     var notes: String = ""
@@ -197,6 +197,8 @@ struct Item: Identifiable, Hashable {
     var createdAt = Date()
     var updatedAt = Date()
     var completedAt: Date?
+    /// Manual sort order shared by every list (lower comes first). Changed only by reordering, never by edits.
+    var position: Double = 0
 
     // Coding
     var repo = ""
@@ -230,6 +232,47 @@ struct Item: Identifiable, Hashable {
     var isDueTodayOrEarlier: Bool {
         guard let dueDate else { return false }
         return dueDate < Calendar.current.startOfDay(for: Date()).addingTimeInterval(86_400)
+    }
+}
+
+// MARK: - Ordering and placement
+
+enum SortOrder: String, CaseIterable, Identifiable {
+    case manual, priority, dueDate, title
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .manual: "Manual"
+        case .priority: "Priority"
+        case .dueDate: "Due Date"
+        case .title: "Title"
+        }
+    }
+}
+
+/// What happens to an item when it is dropped or pasted somewhere. `nil` fields leave the item unchanged.
+struct Placement: Equatable {
+    var kind: ItemKind?
+    var projectID: String?
+    var status: ItemStatus?
+    var today: Bool?
+
+    func apply(to item: inout Item) {
+        if let kind { item.kind = kind }
+        if let projectID { item.projectID = projectID }
+        if let status { item.status = status }
+        if let today {
+            item.flaggedToday = today
+            // Today never shows untriaged items, so landing there triages it.
+            if today, item.status == .inbox { item.status = .todo }
+        }
+    }
+
+    /// Section-level rules win over list-level ones.
+    func merged(with section: Placement) -> Placement {
+        Placement(kind: section.kind ?? kind, projectID: section.projectID ?? projectID,
+                  status: section.status ?? status, today: section.today ?? today)
     }
 }
 

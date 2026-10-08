@@ -33,6 +33,8 @@ struct ContentView: View {
                     if let id = app.selectedItemID, store.item(id) != nil {
                         ItemDetailView(itemID: id)
                             .id(id)
+                    } else if app.selectedItemIDs.count > 1 {
+                        MultiSelectionView(ids: app.selectedItemIDs)
                     } else {
                         ContentUnavailableView("No Item Selected", systemImage: "square.dashed",
                                                description: Text("Select an item to see its details, or press ⌘N to add one."))
@@ -66,12 +68,26 @@ struct ContentView: View {
             agent.contextProvider = { [store, app] in AgentChatView.context(store: store, app: app) }
         }
         .onChange(of: app.selection) { _, new in
-            // Keep the selection only if the item is still visible in the new list.
-            if let id = app.selectedItemID, let new, new != .review,
-               store.items(for: new).contains(where: { $0.id == id }) {
-                return
+            // Keep only the selected items that are still visible in the new list.
+            guard let new, new != .review else { app.selectedItemIDs = []; return }
+            let visible = Set(store.items(for: new).map(\.id))
+            app.selectedItemIDs.formIntersection(visible)
+        }
+        .confirmationDialog(
+            deleteTitle,
+            isPresented: Binding(get: { !app.pendingDeleteIDs.isEmpty }, set: { if !$0 { app.pendingDeleteIDs = [] } })
+        ) {
+            Button("Delete", role: .destructive) {
+                for id in app.pendingDeleteIDs { store.deleteItem(id) }
+                app.selectedItemIDs.subtract(app.pendingDeleteIDs)
+                app.pendingDeleteIDs = []
             }
-            app.selectedItemID = nil
+            Button("Mark as Dropped Instead") {
+                ItemActions(store: store, app: app).markDropped(app.pendingDeleteIDs)
+                app.pendingDeleteIDs = []
+            }
+        } message: {
+            Text("Deleting removes items and their activity history permanently.")
         }
         .alert("Something went wrong", isPresented: Binding(
             get: { store.lastError != nil },
@@ -81,6 +97,12 @@ struct ContentView: View {
         } message: {
             Text(store.lastError ?? "")
         }
+    }
+
+    private var deleteTitle: String {
+        let ids = app.pendingDeleteIDs
+        if ids.count == 1, let item = store.item(ids.first) { return "Delete “\(item.title)”?" }
+        return "Delete \(ids.count) items?"
     }
 
     static let inspectorWidth: CGFloat = 360

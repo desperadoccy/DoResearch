@@ -31,6 +31,13 @@ struct DoResearchApp: App {
                 Button("New Project…") { appState.showingNewProject = true }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
             }
+            CommandGroup(after: .pasteboard) {
+                Button("Duplicate") {
+                    ItemActions(store: store, app: appState).duplicate(appState.selectedItemIDs)
+                }
+                .keyboardShortcut("d")
+                .disabled(appState.selectedItemIDs.isEmpty)
+            }
             CommandMenu("Go") {
                 Button("Today") { appState.selection = .today }.keyboardShortcut("1")
                 Button("Inbox") { appState.selection = .inbox }.keyboardShortcut("2")
@@ -58,7 +65,16 @@ struct DoResearchApp: App {
 @MainActor
 final class AppState {
     var selection: SidebarSelection? = .today
-    var selectedItemID: String?
+    var selectedItemIDs: Set<String> = []
+    /// The single selected item, or nil when nothing or several items are selected.
+    var selectedItemID: String? {
+        get { selectedItemIDs.count == 1 ? selectedItemIDs.first : nil }
+        set { selectedItemIDs = newValue.map { [$0] } ?? [] }
+    }
+    /// Items cut with ⌘X; the next paste moves them as long as the clipboard still holds them.
+    var cutIDs: Set<String> = []
+    /// Items awaiting delete confirmation.
+    var pendingDeleteIDs: Set<String> = []
     var showAgent = false
     var showingNewProject = false
     var search = ""

@@ -145,8 +145,12 @@ struct AgentChatView: View {
         case .some(let s): lines.append("Viewing the \(String(describing: s).capitalized) list.")
         case .none: break
         }
-        if let item = store.item(app.selectedItemID) {
+        let selected = ItemActions(store: store, app: app).ordered(app.selectedItemIDs)
+        if selected.count == 1, let item = selected.first {
             lines.append("Selected item: “\(item.title)” (id \(item.id), \(item.kind.rawValue), \(item.statusLabel)).")
+        } else if !selected.isEmpty {
+            lines.append("Selected \(selected.count) items:")
+            lines += selected.prefix(30).map { "- “\($0.title)” (id \($0.id), \($0.kind.rawValue), \($0.statusLabel))" }
         }
         return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
