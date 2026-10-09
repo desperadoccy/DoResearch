@@ -24,9 +24,33 @@ Headless checks for the data layer and agent tools:
 - **Items** have a *kind*: Coding, Experiment, Writing, Reading, Task, Personal, Misc. Statuses are shared but named per kind — an experiment is *Planned → Running → Analyzing → Concluded*; coding is *To Do → In Development → In Review → Merged*.
 - **Experiments** track hypothesis, setup, compute, run start/end (timed automatically when the status changes), metrics, results, outcome (supported / refuted / inconclusive / failed), and conclusion.
 - **Coding items** track repo, branch, PR/issue link, and a checklist of implementation steps with progress.
-- **Projects** group items (e.g. one paper) and show per-kind progress and a deadline.
+- **Projects** group items and come in three types (see below).
 - **Progress log**: every status change and note is timestamped per item; changes made by the assistant are marked as such.
 - **Review** dashboard (⌘4): completed/added counts, experiments by phase, active coding, blocked/overdue/stale work, per-project progress, and an activity timeline over 7/14/30 days.
+
+## Projects
+
+Each project has a type that sets which kind new items get and how its progress is shown:
+
+| Type | For | Progress |
+|---|---|---|
+| **Research** | A paper, research thread, or system | Coding / experiment / writing progress bars and a deadline |
+| **Personal** | An area or effort in your life: health, finances, a trip, a move | Open, done this week, overdue, and next due |
+| **Misc** | Everything else: errands, admin, reviewing duties | Open, done this week, overdue, and next due |
+
+Personal and misc projects are often ongoing, so the deadline is optional and shown as a *target date*. Pick the type when creating a project, or change it later in the editor or from the project's context menu. When you change a project to Personal or Misc, the editor can convert its items to the matching kind too.
+
+Filing an item into a project of a different type changes its kind to match. This applies to the sidebar drop, the Project picker, and the context menu. A coding item moved into *Health* becomes Personal. Research items keep their kind inside research projects.
+
+### Sidebar
+
+- **Today, Inbox, Upcoming, Review**: lists that collect items from everywhere.
+- **Research**: Coding, Experiments, Writing, Reading, Tasks.
+- **Life**: Personal, Misc.
+- **Projects**: every project of every type in one list, told apart by icon and color (hover to see the type). The **+** menu creates a Research, Personal, or Misc project. Archived projects are folded in at the bottom.
+- **All Items, Logbook**.
+
+The Review dashboard and the Project pickers group projects by type.
 
 ## Moving, copying, and rearranging
 
@@ -40,7 +64,7 @@ Headless checks for the data layer and agent tools:
 
 ## Assistant
 
-Open with ⌘J. The assistant works through tools that read and modify the same database the UI uses: list/get/create/update items, edit checklists, log progress, manage projects, and produce a review summary. It sees which list and items you're looking at, so "log that this run finished with ppl 18.9" applies to the selected experiment. It can mark items *dropped* but cannot delete them.
+Open with ⌘J. The assistant works through tools that read and modify the same database the UI uses: list/get/create/update items, edit checklists, log progress, manage projects, and produce a review summary. It knows the project types and files personal and misc items into matching projects, not research ones. It sees which list and items you're looking at, so "log that this run finished with ppl 18.9" applies to the selected experiment. It can mark items *dropped* but cannot delete them.
 
 ### Model providers
 
@@ -58,7 +82,7 @@ Add one from a preset with **+**, set its base URL, key, and model (the ↻ butt
 | | |
 |---|---|
 | ⌘N | New item (focuses quick-add) |
-| ⇧⌘N | New project |
+| ⇧⌘N | New project (type follows the current list or project; **File → New Project** picks one) |
 | ⌘1 – ⌘4 | Today, Inbox, Upcoming, Review |
 | ⌘5 – ⌘7 | Coding, Experiments, Writing |
 | ⌘J | Toggle assistant |
