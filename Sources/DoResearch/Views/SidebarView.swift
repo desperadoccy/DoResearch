@@ -17,40 +17,17 @@ struct SidebarView: View {
                 row(.review, "Review", "chart.bar.doc.horizontal", .green)
             }
 
-            Section("Research") {
-                ForEach([ItemKind.coding, .experiment, .writing, .reading, .task]) { kind in
-                    row(.kind(kind), kind.pluralLabel, kind.symbol, kind.color)
-                }
+            ForEach(ProjectType.allCases) { type in
+                areaSection(type)
             }
 
-            Section("Life") {
-                ForEach([ItemKind.personal, .misc]) { kind in
-                    row(.kind(kind), kind.pluralLabel, kind.symbol, kind.color)
-                }
-            }
-
-            Section {
-                ForEach(store.projects.filter { $0.status != .archived }) { project in
-                    projectRow(project)
-                }
-                let archived = store.projects.filter { $0.status == .archived }
-                if !archived.isEmpty {
-                    DisclosureGroup("Archived") {
+            let archived = store.projects.filter { $0.status == .archived }
+            if !archived.isEmpty {
+                Section {
+                    DisclosureGroup("Archived Projects") {
                         ForEach(archived) { projectRow($0) }
                     }
                     .foregroundStyle(.secondary)
-                }
-            } header: {
-                HStack {
-                    Text("Projects")
-                    Spacer()
-                    Button {
-                        app.showingNewProject = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("New Project (⇧⌘N)")
                 }
             }
 
@@ -75,6 +52,30 @@ struct SidebarView: View {
             }
         } message: { _ in
             Text("Items in this project are kept and become unassigned.")
+        }
+    }
+
+    /// One area of life: its item lists, then its projects, with a + that creates a project of that type.
+    private func areaSection(_ type: ProjectType) -> some View {
+        Section {
+            ForEach(type.kinds) { kind in
+                row(.kind(kind), kind.pluralLabel, kind.symbol, kind.color)
+            }
+            ForEach(store.projects(of: type)) { project in
+                projectRow(project)
+            }
+        } header: {
+            HStack {
+                Text(type.label)
+                Spacer()
+                Button {
+                    app.newProject(type)
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.borderless)
+                .help("New \(type.label) Project")
+            }
         }
     }
 
@@ -103,6 +104,16 @@ struct SidebarView: View {
         .modifier(SidebarDropTarget(selection: .project(project.id), target: $dropTarget))
         .contextMenu {
             Button("Edit Project…") { editingProject = project }
+            Menu("Type") {
+                ForEach(ProjectType.allCases) { type in
+                    Toggle(type.label, isOn: Binding(get: { project.type == type }, set: { on in
+                        guard on else { return }
+                        var p = project
+                        p.type = type
+                        store.updateProject(p)
+                    }))
+                }
+            }
             Menu("Status") {
                 ForEach(ProjectStatus.allCases) { status in
                     Button(status.label) {

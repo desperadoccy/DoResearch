@@ -33,7 +33,12 @@ struct DoResearchApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Item") { appState.requestNewItem() }
                     .keyboardShortcut("n")
-                Button("New Project…") { appState.showingNewProject = true }
+                Menu("New Project") {
+                    ForEach(ProjectType.allCases) { type in
+                        Button("\(type.label) Project…") { appState.newProject(type) }
+                    }
+                }
+                Button("New Project…") { appState.newProject(appState.contextProjectType(in: store)) }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
             }
             CommandGroup(after: .pasteboard) {
@@ -79,6 +84,21 @@ final class AppState {
     var pendingDeleteIDs: Set<String> = []
     var showAgent = false
     var showingNewProject = false
+    var newProjectType: ProjectType = .research
+
+    func newProject(_ type: ProjectType) {
+        newProjectType = type
+        showingNewProject = true
+    }
+
+    /// The project type that fits what's on screen, for ⇧⌘N.
+    func contextProjectType(in store: Store) -> ProjectType {
+        switch selection {
+        case .kind(let k): ProjectType(kind: k)
+        case .project(let id): store.project(id)?.type ?? .research
+        default: .research
+        }
+    }
     var search = ""
     /// Incremented to ask the list to focus its quick-add field.
     var newItemRequest = 0

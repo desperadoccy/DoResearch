@@ -66,6 +66,36 @@ final class Store {
 
     var activeProjects: [Project] { projects.filter { $0.status == .active || $0.status == .paused } }
 
+    /// Non-archived projects of one type, in creation order.
+    func projects(of type: ProjectType, includeArchived: Bool = false) -> [Project] {
+        projects.filter { $0.type == type && (includeArchived || $0.status != .archived) }
+    }
+
+    /// Where an item belongs: its project's type if it has one, otherwise what its kind suggests.
+    func type(of item: Item) -> ProjectType {
+        project(item.projectID)?.type ?? ProjectType(kind: item.kind)
+    }
+
+    /// Counts for projects whose progress isn't measured by research kinds.
+    struct ProjectPulse {
+        var open = 0
+        var doneThisWeek = 0
+        var overdue = 0
+        var nextDue: Item?
+    }
+
+    func pulse(projectID: String) -> ProjectPulse {
+        let weekAgo = Date().addingTimeInterval(-7 * 86_400)
+        let scoped = items.filter { $0.projectID == projectID && $0.status != .dropped }
+        let open = scoped.filter(\.status.isOpen)
+        return ProjectPulse(
+            open: open.count,
+            doneThisWeek: scoped.filter { $0.status == .done && ($0.completedAt ?? .distantPast) >= weekAgo }.count,
+            overdue: open.filter(\.isOverdue).count,
+            nextDue: open.filter { $0.dueDate != nil }.min { $0.dueDate! < $1.dueDate! }
+        )
+    }
+
     // MARK: Items
 
     /// Inserts a new item at the top of the manual order. Checklist steps come from `checklist` if given,
@@ -240,6 +270,7 @@ final class Store {
         for source in incoming {
             if !copy, var existing = item(source.id) {
                 placement.apply(to: &existing)
+                fitKindToProject(&existing, explicitKind: placement.kind)
                 updateItem(existing)
                 placed.append(existing.id)
             } else {
@@ -247,12 +278,20 @@ final class Store {
                 var draft = live ?? source
                 draft.id = ""
                 placement.apply(to: &draft)
+                fitKindToProject(&draft, explicitKind: placement.kind)
                 let created = createItem(draft, logText: live.map { "Copied from “\($0.title)”" })
                 placed.append(created.id)
             }
         }
         if let visible { reorder(placed, before: anchorID, within: visible) }
         return placed
+    }
+
+    /// An item filed into a project of another type takes that type's kind (a coding item moved into "Health" becomes
+    /// Personal); research kinds are kept within research projects. An explicit kind from the drop target wins.
+    func fitKindToProject(_ item: inout Item, explicitKind: ItemKind?) {
+        guard explicitKind == nil, let type = project(item.projectID)?.type, ProjectType(kind: item.kind) != type else { return }
+        item.kind = type.defaultKind
     }
 
     /// Copies each item and puts the copy right after its original.
@@ -341,11 +380,11 @@ final class Store {
         p.updatedAt = p.createdAt
         do {
             try db.execute(
-                "INSERT INTO projects (id, name, summary, color, symbol, status, deadline, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                [p.id, p.name, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.createdAt, p.updatedAt]
+                "INSERT INTO projects (id, name, type, summary, color, symbol, status, deadline, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [p.id, p.name, p.type.rawValue, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.createdAt, p.updatedAt]
             )
             projects.append(p)
-            log(item: nil, project: p.id, kind: "created", text: "Created project “\(p.name)”", author: author)
+            log(item: nil, project: p.id, kind: "created", text: "Created \(p.type.label.lowercased()) project “\(p.name)”", author: author)
         } catch {
             report(error)
         }
@@ -359,12 +398,15 @@ final class Store {
         p.updatedAt = Date()
         do {
             try db.execute(
-                "UPDATE projects SET name = ?, summary = ?, color = ?, symbol = ?, status = ?, deadline = ?, updated_at = ? WHERE id = ?",
-                [p.name, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.updatedAt, p.id]
+                "UPDATE projects SET name = ?, type = ?, summary = ?, color = ?, symbol = ?, status = ?, deadline = ?, updated_at = ? WHERE id = ?",
+                [p.name, p.type.rawValue, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.updatedAt, p.id]
             )
             projects[index] = p
             if old.status != p.status {
                 log(item: nil, project: p.id, kind: "status", text: "Project \(old.status.label) → \(p.status.label)", author: author)
+            }
+            if old.type != p.type {
+                log(item: nil, project: p.id, kind: "update", text: "Project type \(old.type.label) → \(p.type.label)", author: author)
             }
         } catch {
             report(error)
@@ -486,7 +528,8 @@ final class Store {
     }
 
     private static func project(from r: Row) -> Project {
-        Project(id: r["id"]?.string ?? "", name: r["name"]?.string ?? "", summary: r["summary"]?.string ?? "",
+        Project(id: r["id"]?.string ?? "", name: r["name"]?.string ?? "",
+                type: ProjectType(rawValue: r["type"]?.string ?? "") ?? .research, summary: r["summary"]?.string ?? "",
                 color: r["color"]?.string ?? "blue", symbol: r["symbol"]?.string ?? "folder",
                 status: ProjectStatus(rawValue: r["status"]?.string ?? "") ?? .active, deadline: r["deadline"]?.date,
                 createdAt: r["created_at"]?.date ?? Date(), updatedAt: r["updated_at"]?.date ?? Date())

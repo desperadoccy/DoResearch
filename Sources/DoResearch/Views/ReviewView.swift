@@ -137,23 +137,28 @@ struct ReviewView: View {
             if active.isEmpty {
                 EmptyLine("No active projects.")
             }
-            ForEach(active) { project in
-                VStack(alignment: .leading, spacing: 6) {
-                    Button {
-                        app.selection = .project(project.id)
-                    } label: {
-                        Label(project.name, systemImage: project.symbol)
-                            .foregroundStyle(project.swiftColor)
-                            .font(.body.weight(.medium))
-                    }
-                    .buttonStyle(.plain)
-                    HStack(spacing: 16) {
-                        ForEach([ItemKind.coding, .experiment, .writing], id: \.self) { kind in
-                            KindProgress(kind: kind, progress: store.progress(kind: kind, projectID: project.id))
+            ForEach(ProjectType.allCases) { type in
+                let group = active.filter { $0.type == type }
+                if !group.isEmpty {
+                    Label(type.label, systemImage: type.symbol)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                    ForEach(group) { project in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Button {
+                                app.selection = .project(project.id)
+                            } label: {
+                                Label(project.name, systemImage: project.symbol)
+                                    .foregroundStyle(project.swiftColor)
+                                    .font(.body.weight(.medium))
+                            }
+                            .buttonStyle(.plain)
+                            ProjectProgress(project: project)
                         }
+                        .padding(.vertical, 4)
                     }
                 }
-                .padding(.vertical, 4)
             }
         }
     }

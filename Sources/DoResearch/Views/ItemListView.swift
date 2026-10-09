@@ -156,7 +156,9 @@ struct ItemListView: View {
         var draft = Item(id: "", title: title)
         switch selection {
         case .kind(let k): draft.kind = k
-        case .project(let id): draft.projectID = id
+        case .project(let id):
+            draft.projectID = id
+            draft.kind = store.project(id)?.type.defaultKind ?? .task
         case .today: draft.flaggedToday = true
         case .inbox: draft.status = .inbox
         default: break

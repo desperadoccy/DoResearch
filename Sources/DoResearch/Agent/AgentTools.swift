@@ -79,6 +79,7 @@ struct AgentTools {
                      "kind": strEnum(kinds, "Filter by kind."),
                      "status": strEnum(statuses + ["open", "closed", "any"], "Filter by status. 'open' (default) excludes done/dropped; 'closed' is done+dropped; 'any' is everything."),
                      "project_id": str("Filter by project id. Use 'none' for items without a project."),
+                     "area": strEnum(ProjectType.allCases.map(\.rawValue), "Filter by area: the item's project type, or for items without a project, the area its kind belongs to (research kinds, personal, misc)."),
                      "query": str("Case-insensitive text search over title, notes, and tags."),
                      "today": ["type": "boolean", "description": "Only items in the Today list (flagged, due, or in progress)."],
                      "limit": ["type": "integer", "description": "Max results (default 50, max 200)."],
@@ -113,12 +114,16 @@ struct AgentTools {
                  ["item_id": str("Item id."), "text": str("The note.")],
                  required: ["item_id", "text"]),
             tool("list_projects",
-                 "List projects with per-kind progress counts.",
-                 ["include_archived": ["type": "boolean", "description": "Include archived projects (default false)."]]),
+                 "List projects with their type. Research projects report per-kind progress; personal and misc projects report open, recently done, and overdue counts.",
+                 [
+                     "type": strEnum(ProjectType.allCases.map(\.rawValue), "Only projects of this type."),
+                     "include_archived": ["type": "boolean", "description": "Include archived projects (default false)."],
+                 ]),
             tool("create_project",
-                 "Create a project (e.g. a paper or research thread). Check list_projects first to avoid duplicates.",
+                 "Create a project. Check list_projects first to avoid duplicates. type: research = a paper, research thread, or system; personal = an area or effort in the user's life (health, finances, a trip, a move); misc = a group for other tasks (errands, admin, reviewing duties).",
                  [
                      "name": str("Project name."),
+                     "type": strEnum(ProjectType.allCases.map(\.rawValue), "Project type (default research)."),
                      "summary": str("Goal, venue, or scope."),
                      "deadline": str("YYYY-MM-DD."),
                      "color": strEnum(Project.palette, "Display color."),
@@ -126,10 +131,11 @@ struct AgentTools {
                  ],
                  required: ["name"]),
             tool("update_project",
-                 "Update a project's name, summary, status, or deadline.",
+                 "Update a project's name, type, summary, status, or deadline. Changing the type doesn't change its items' kinds.",
                  [
                      "id": str("Project id."),
                      "name": str("New name."),
+                     "type": strEnum(ProjectType.allCases.map(\.rawValue), "Project type."),
                      "summary": str("New summary."),
                      "status": strEnum(ProjectStatus.allCases.map(\.rawValue), "Project status."),
                      "deadline": str("YYYY-MM-DD, or empty string to clear."),
@@ -172,12 +178,14 @@ struct AgentTools {
         let kind = try a.enumValue("kind", ItemKind.self)
         let statusFilter = try a.string("status") ?? "open"
         let projectID = try a.string("project_id")
+        let area = try a.enumValue("area", ProjectType.self)
         let query = try a.string("query")?.lowercased()
         let todayOnly = try a.bool("today") ?? false
         let limit = min(max(try a.int("limit") ?? 50, 1), 200)
 
         var list = todayOnly ? store.items(for: .today) : store.items.sorted(by: Store.sortKey)
         if let kind { list = list.filter { $0.kind == kind } }
+        if let area { list = list.filter { store.type(of: $0) == area } }
         switch statusFilter {
         case "open": list = list.filter { $0.status.isOpen }
         case "closed": list = list.filter { !$0.status.isOpen }
@@ -337,14 +345,23 @@ struct AgentTools {
 
     private func listProjects(_ a: Args) throws -> ToolOutcome {
         let includeArchived = try a.bool("include_archived") ?? false
-        let list = store.projects.filter { includeArchived || $0.status != .archived }
+        let type = try a.enumValue("type", ProjectType.self)
+        let list = store.projects.filter { (includeArchived || $0.status != .archived) && (type == nil || $0.type == type) }
         let payload = list.map { p -> [String: Any] in
-            var progress: [String: String] = [:]
-            for kind in ItemKind.allCases {
-                let pr = store.progress(kind: kind, projectID: p.id)
-                if pr.total > 0 { progress[kind.rawValue] = "\(pr.done)/\(pr.total) done" }
+            var d: [String: Any] = ["id": p.id, "name": p.name, "type": p.type.rawValue, "status": p.status.rawValue]
+            if p.type == .research {
+                var progress: [String: String] = [:]
+                for kind in ItemKind.allCases {
+                    let pr = store.progress(kind: kind, projectID: p.id)
+                    if pr.total > 0 { progress[kind.rawValue] = "\(pr.done)/\(pr.total) done" }
+                }
+                d["progress"] = progress
+            } else {
+                let pulse = store.pulse(projectID: p.id)
+                var counts: [String: Any] = ["open": pulse.open, "done_last_7_days": pulse.doneThisWeek, "overdue": pulse.overdue]
+                if let next = pulse.nextDue, let due = next.dueDate { counts["next_due"] = ["id": next.id, "title": next.title, "due": day(due)] }
+                d["activity"] = counts
             }
-            var d: [String: Any] = ["id": p.id, "name": p.name, "status": p.status.rawValue, "progress": progress]
             if !p.summary.isEmpty { d["summary"] = p.summary }
             if let deadline = p.deadline { d["deadline"] = day(deadline) }
             return d
@@ -355,13 +372,15 @@ struct AgentTools {
     private func createProject(_ a: Args) throws -> ToolOutcome {
         let name = try a.requiredString("name").trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { throw ToolInputError(message: "name must not be empty") }
-        var draft = Project(id: "", name: name)
+        let type = try a.enumValue("type", ProjectType.self) ?? .research
+        var draft = Project(id: "", name: name, type: type)
         draft.summary = try a.string("summary") ?? ""
         if case .set(let d) = try a.date("deadline") { draft.deadline = d }
-        if let c = try a.string("color") { draft.color = Project.palette.contains(c) ? c : "blue" }
-        if let s = try a.string("symbol") { draft.symbol = Project.symbols.contains(s) ? s : "folder" }
+        if let c = try a.string("color") { draft.color = Project.palette.contains(c) ? c : type.defaultColor }
+        if let s = try a.string("symbol") { draft.symbol = Project.symbols.contains(s) ? s : type.defaultSymbol }
         let p = store.createProject(draft, author: .agent)
-        return ToolOutcome(result: json(["created": ["id": p.id, "name": p.name]]), summary: "Created project “\(p.name)”", isError: false)
+        return ToolOutcome(result: json(["created": ["id": p.id, "name": p.name, "type": p.type.rawValue]]),
+                           summary: "Created \(p.type.label.lowercased()) project “\(p.name)”", isError: false)
     }
 
     private func updateProject(_ a: Args) throws -> ToolOutcome {
@@ -369,6 +388,7 @@ struct AgentTools {
         guard var p = store.project(id) else { throw ToolInputError(message: "No project with id \(id)") }
         if let v = try a.string("name"), !v.isEmpty { p.name = v }
         if let v = try a.string("summary") { p.summary = v }
+        if let v = try a.enumValue("type", ProjectType.self) { p.type = v }
         if let v = try a.enumValue("status", ProjectStatus.self) { p.status = v }
         switch try a.date("deadline") {
         case .set(let d): p.deadline = d
@@ -376,7 +396,7 @@ struct AgentTools {
         case .absent: break
         }
         store.updateProject(p, author: .agent)
-        return ToolOutcome(result: json(["updated": ["id": p.id, "name": p.name, "status": p.status.rawValue]]),
+        return ToolOutcome(result: json(["updated": ["id": p.id, "name": p.name, "type": p.type.rawValue, "status": p.status.rawValue]]),
                            summary: "Updated project “\(p.name)”", isError: false)
     }
 
@@ -418,7 +438,7 @@ struct AgentTools {
         var d: [String: Any] = ["id": i.id, "title": i.title, "kind": i.kind.rawValue, "status": i.status.rawValue,
                                 "status_label": i.statusLabel, "updated": day(i.updatedAt)]
         if i.priority != .none { d["priority"] = i.priority.name }
-        if let p = store.project(i.projectID) { d["project"] = ["id": p.id, "name": p.name] }
+        if let p = store.project(i.projectID) { d["project"] = ["id": p.id, "name": p.name, "type": p.type.rawValue] }
         if let due = i.dueDate { d["due"] = day(due) }
         if i.flaggedToday { d["today"] = true }
         if !i.tags.isEmpty { d["tags"] = i.tags }

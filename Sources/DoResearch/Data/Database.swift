@@ -220,5 +220,15 @@ final class Database {
             }
             didAddPositions = true
         }
+        if version < 3 {
+            try transaction {
+                let columns = try query("PRAGMA table_info(projects)").compactMap { $0["name"]?.string }
+                if !columns.contains("type") {
+                    // Every project before this version was a research project.
+                    try execute("ALTER TABLE projects ADD COLUMN type TEXT NOT NULL DEFAULT 'research'")
+                }
+                try execute("PRAGMA user_version = 3")
+            }
+        }
     }
 }

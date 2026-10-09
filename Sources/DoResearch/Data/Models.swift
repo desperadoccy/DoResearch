@@ -276,6 +276,96 @@ struct Placement: Equatable {
     }
 }
 
+/// What a project organizes. Decides where it appears in the sidebar, which kind new items get, and how progress is shown.
+enum ProjectType: String, CaseIterable, Identifiable, Codable {
+    case research, personal, misc
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .research: "Research"
+        case .personal: "Personal"
+        case .misc: "Misc"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .research: "graduationcap"
+        case .personal: "person.crop.circle"
+        case .misc: "tray.full"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .research: "A paper, research thread, or system. Tracks coding, experiments, and writing separately."
+        case .personal: "An area of your life such as health, finances, a trip, or a move. Can be ongoing."
+        case .misc: "A group for everything else: errands, admin, service duties, side tasks."
+        }
+    }
+
+    var namePrompt: String {
+        switch self {
+        case .research: "e.g. Sparse Attention Paper"
+        case .personal: "e.g. Health, Apartment Move, Japan Trip"
+        case .misc: "e.g. Errands, Reviewing Duties, Admin"
+        }
+    }
+
+    /// Kind given to items created inside a project of this type.
+    var defaultKind: ItemKind {
+        switch self {
+        case .research: .task
+        case .personal: .personal
+        case .misc: .misc
+        }
+    }
+
+    /// Item kinds listed under this type's sidebar section.
+    var kinds: [ItemKind] {
+        switch self {
+        case .research: [.coding, .experiment, .writing, .reading, .task]
+        case .personal: [.personal]
+        case .misc: [.misc]
+        }
+    }
+
+    var defaultColor: String {
+        switch self {
+        case .research: "blue"
+        case .personal: "pink"
+        case .misc: "gray"
+        }
+    }
+
+    var symbols: [String] {
+        switch self {
+        case .research:
+            ["folder", "brain", "cpu", "network", "server.rack", "function", "chart.xyaxis.line",
+             "doc.text", "graduationcap", "lightbulb", "atom", "lock.shield", "globe", "camera.aperture"]
+        case .personal:
+            ["heart", "figure.run", "house", "airplane", "cart", "dollarsign.circle", "stethoscope",
+             "book", "gift", "person.2", "fork.knife", "leaf", "pawprint", "music.note"]
+        case .misc:
+            ["tray.full", "wrench.and.screwdriver", "envelope", "calendar", "shippingbox", "paperclip", "archivebox",
+             "list.bullet.clipboard", "creditcard", "car", "hammer", "star", "person.3", "building.columns"]
+        }
+    }
+
+    var defaultSymbol: String { symbols[0] }
+
+    /// The project type an item kind naturally belongs to.
+    init(kind: ItemKind) {
+        switch kind {
+        case .personal: self = .personal
+        case .misc: self = .misc
+        default: self = .research
+        }
+    }
+}
+
 enum ProjectStatus: String, CaseIterable, Identifiable, Codable {
     case active, paused, done, archived
     var id: String { rawValue }
@@ -285,6 +375,7 @@ enum ProjectStatus: String, CaseIterable, Identifiable, Codable {
 struct Project: Identifiable, Hashable {
     var id: String
     var name: String
+    var type: ProjectType = .research
     var summary = ""
     var color = "blue"
     var symbol = "folder"
@@ -294,10 +385,30 @@ struct Project: Identifiable, Hashable {
     var updatedAt = Date()
 
     static let palette: [String] = ["blue", "purple", "pink", "red", "orange", "yellow", "green", "teal", "indigo", "gray"]
-    static let symbols: [String] = [
-        "folder", "brain", "cpu", "network", "server.rack", "function", "chart.xyaxis.line",
-        "doc.text", "graduationcap", "lightbulb", "atom", "lock.shield", "globe", "camera.aperture",
-    ]
+    /// Every icon any project type offers (the assistant may pick any of them).
+    static let symbols: [String] = ProjectType.allCases.flatMap(\.symbols).reduce(into: []) { if !$0.contains($1) { $0.append($1) } }
+
+    init(id: String, name: String, type: ProjectType = .research) {
+        self.id = id
+        self.name = name
+        self.type = type
+        color = type.defaultColor
+        symbol = type.defaultSymbol
+    }
+
+    init(id: String, name: String, type: ProjectType, summary: String, color: String, symbol: String,
+         status: ProjectStatus, deadline: Date?, createdAt: Date, updatedAt: Date) {
+        self.id = id
+        self.name = name
+        self.type = type
+        self.summary = summary
+        self.color = color
+        self.symbol = symbol
+        self.status = status
+        self.deadline = deadline
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
 
     var swiftColor: Color { Color.named(color) }
 }

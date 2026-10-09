@@ -62,7 +62,7 @@ struct ContentView: View {
         }
         .searchable(text: $app.search, placement: .sidebar, prompt: "Search items")
         .sheet(isPresented: $app.showingNewProject) {
-            ProjectEditor(project: nil)
+            ProjectEditor(project: nil, initialType: app.newProjectType)
         }
         .onAppear {
             agent.contextProvider = { [store, app] in AgentChatView.context(store: store, app: app) }
