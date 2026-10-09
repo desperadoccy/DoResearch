@@ -101,7 +101,7 @@ struct ProjectProgress: View {
 
     private func stat(_ value: String, _ label: String, _ symbol: String, _ color: Color) -> some View {
         Label {
-            Text(value).monospacedDigit().foregroundStyle(.primary) + Text(" \(label)").foregroundStyle(.secondary)
+            Text("\(Text(value).monospacedDigit().foregroundStyle(.primary)) \(label)").foregroundStyle(.secondary)
         } icon: {
             Image(systemName: symbol).foregroundStyle(color)
         }

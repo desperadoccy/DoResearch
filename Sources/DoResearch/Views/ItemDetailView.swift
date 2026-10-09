@@ -38,6 +38,19 @@ struct ItemDetailView: View {
         }
     }
 
+    /// Moving an item into a project of another type also gives it that type's kind, as drag-and-drop does.
+    private func projectBinding(_ item: Item) -> Binding<String?> {
+        Binding(
+            get: { (store.item(itemID) ?? item).projectID },
+            set: { value in
+                var copy = store.item(itemID) ?? item
+                copy.projectID = value
+                store.fitKindToProject(&copy, explicitKind: nil)
+                store.updateItem(copy)
+            }
+        )
+    }
+
     private func bind<T>(_ item: Item, _ kp: WritableKeyPath<Item, T>) -> Binding<T> {
         Binding(
             get: { (store.item(itemID) ?? item)[keyPath: kp] },
@@ -99,10 +112,17 @@ struct ItemDetailView: View {
                 Picker("Priority", selection: bind(item, \.priority)) {
                     ForEach(Priority.allCases) { Text($0.label).tag($0) }
                 }
-                Picker("Project", selection: bind(item, \.projectID)) {
+                Picker("Project", selection: projectBinding(item)) {
                     Text("None").tag(String?.none)
-                    ForEach(store.projects) { p in
-                        Label(p.name, systemImage: p.symbol).tag(Optional(p.id))
+                    ForEach(ProjectType.allCases) { type in
+                        let group = store.projects(of: type, includeArchived: true)
+                        if !group.isEmpty {
+                            Section(type.label) {
+                                ForEach(group) { p in
+                                    Label(p.name, systemImage: p.symbol).tag(Optional(p.id))
+                                }
+                            }
+                        }
                     }
                 }
                 let due = optionalDate(item, \.dueDate) { Calendar.current.startOfDay(for: Date()).addingTimeInterval(86_400) }

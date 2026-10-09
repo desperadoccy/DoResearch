@@ -176,8 +176,20 @@ struct ItemContextMenu: View {
             Menu("Project") {
                 Button("None") { mutate(items) { $0.projectID = nil } }
                 Divider()
-                ForEach(store.activeProjects) { p in
-                    Button(p.name) { mutate(items) { $0.projectID = p.id } }
+                ForEach(ProjectType.allCases) { type in
+                    let group = store.activeProjects.filter { $0.type == type }
+                    if !group.isEmpty {
+                        Section(type.label) {
+                            ForEach(group) { p in
+                                Button(p.name) {
+                                    mutate(items) {
+                                        $0.projectID = p.id
+                                        store.fitKindToProject(&$0, explicitKind: nil)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             let allToday = items.allSatisfy(\.flaggedToday)

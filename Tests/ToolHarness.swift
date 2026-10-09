@@ -169,6 +169,41 @@ struct ToolHarness {
         expect(migrated.items(for: .all, order: .manual).map(\.id) == ["high", "mid", "low"], "v1 → v2 keeps priority order as manual order")
         try? FileManager.default.removeItem(at: url3)
 
+        // MARK: Project types separate research, personal, and misc work.
+        let health = call("create_project", ["name": "Health", "type": "personal"])
+        let hid = ((health["created"] as? [String: Any])?["id"] as? String) ?? ""
+        expect(store.project(hid)?.type == .personal && store.project(hid)?.symbol == ProjectType.personal.defaultSymbol,
+               "personal project gets its type and default look")
+        let researchOnly = call("list_projects", ["type": "research"])["projects"] as? [[String: Any]] ?? []
+        expect(!researchOnly.isEmpty && researchOnly.allSatisfy { $0["type"] as? String == "research" }, "list_projects filters by type")
+        _ = call("create_item", ["title": "Book dentist", "kind": "personal", "project_id": hid, "due_date": "2020-01-01"])
+        let personalList = call("list_projects", ["type": "personal"])["projects"] as? [[String: Any]] ?? []
+        let activity = personalList.first { $0["id"] as? String == hid }?["activity"] as? [String: Any]
+        expect(activity?["open"] as? Int == 1 && activity?["overdue"] as? Int == 1, "personal projects report activity, not kind progress")
+        let areaItems = call("list_items", ["area": "personal"])["items"] as? [[String: Any]] ?? []
+        expect(areaItems.count == 1 && areaItems.first?["title"] as? String == "Book dentist", "list_items filters by area")
+        let stray = store.createItem(Item(id: "", title: "Refactor loader"))
+        var refiled = store.item(stray.id)!
+        refiled.projectID = hid
+        store.fitKindToProject(&refiled, explicitKind: nil)
+        expect(refiled.kind == .personal, "item filed into a personal project takes the personal kind")
+        refiled.projectID = pid
+        refiled.kind = .experiment
+        store.fitKindToProject(&refiled, explicitKind: nil)
+        expect(refiled.kind == .experiment, "research kinds stay as they are in research projects")
+
+        // MARK: Migration from schema v2 marks existing projects as research.
+        let url4 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("dr-harness-\(UUID().uuidString).sqlite")
+        do {
+            let db = try Database(url: url4)
+            try db.execute("ALTER TABLE projects DROP COLUMN type")
+            try db.execute("PRAGMA user_version = 2")
+            let now = Date().timeIntervalSince1970
+            try db.execute("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?,?,?,?)", ["old", "Old Paper", now, now])
+        } catch { expect(false, "set up v2 database: \(error)") }
+        expect(Store(url: url4).project("old")?.type == .research, "v2 → v3 makes existing projects research projects")
+        try? FileManager.default.removeItem(at: url4)
+
         await ProviderHarness.run(expect: expect)
 
         print(failures == 0 ? "\nAll checks passed." : "\n\(failures) check(s) failed.")

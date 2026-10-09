@@ -17,19 +17,19 @@ struct SidebarView: View {
                 row(.review, "Review", "chart.bar.doc.horizontal", .green)
             }
 
-            ForEach(ProjectType.allCases) { type in
-                areaSection(type)
-            }
-
-            let archived = store.projects.filter { $0.status == .archived }
-            if !archived.isEmpty {
-                Section {
-                    DisclosureGroup("Archived Projects") {
-                        ForEach(archived) { projectRow($0) }
-                    }
-                    .foregroundStyle(.secondary)
+            Section("Research") {
+                ForEach(ProjectType.research.kinds) { kind in
+                    row(.kind(kind), kind.pluralLabel, kind.symbol, kind.color)
                 }
             }
+
+            Section("Life") {
+                ForEach(ProjectType.personal.kinds + ProjectType.misc.kinds) { kind in
+                    row(.kind(kind), kind.pluralLabel, kind.symbol, kind.color)
+                }
+            }
+
+            projectsSection
 
             Section {
                 row(.all, "All Items", "square.stack", .secondary)
@@ -55,26 +55,38 @@ struct SidebarView: View {
         }
     }
 
-    /// One area of life: its item lists, then its projects, with a + that creates a project of that type.
-    private func areaSection(_ type: ProjectType) -> some View {
+    /// Every project in one list, whatever its type; the project's icon and color tell them apart.
+    private var projectsSection: some View {
         Section {
-            ForEach(type.kinds) { kind in
-                row(.kind(kind), kind.pluralLabel, kind.symbol, kind.color)
-            }
-            ForEach(store.projects(of: type)) { project in
+            ForEach(store.projects.filter { $0.status != .archived }) { project in
                 projectRow(project)
+            }
+            let archived = store.projects.filter { $0.status == .archived }
+            if !archived.isEmpty {
+                DisclosureGroup("Archived") {
+                    ForEach(archived) { projectRow($0) }
+                }
+                .foregroundStyle(.secondary)
             }
         } header: {
             HStack {
-                Text(type.label)
+                Text("Projects")
                 Spacer()
-                Button {
-                    app.newProject(type)
+                Menu {
+                    ForEach(ProjectType.allCases) { type in
+                        Button {
+                            app.newProject(type)
+                        } label: {
+                            Label("\(type.label) Project…", systemImage: type.symbol)
+                        }
+                    }
                 } label: {
                     Image(systemName: "plus")
                 }
-                .buttonStyle(.borderless)
-                .help("New \(type.label) Project")
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("New Project (⇧⌘N)")
             }
         }
     }
@@ -100,6 +112,7 @@ struct SidebarView: View {
             Image(systemName: project.symbol).foregroundStyle(project.swiftColor)
         }
         .badge(count)
+        .help("\(project.type.label) project")
         .tag(SidebarSelection.project(project.id))
         .modifier(SidebarDropTarget(selection: .project(project.id), target: $dropTarget))
         .contextMenu {

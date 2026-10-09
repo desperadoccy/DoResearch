@@ -276,7 +276,7 @@ struct Placement: Equatable {
     }
 }
 
-/// What a project organizes. Decides where it appears in the sidebar, which kind new items get, and how progress is shown.
+/// What a project organizes. Decides which kind new items get, and how progress is shown.
 enum ProjectType: String, CaseIterable, Identifiable, Codable {
     case research, personal, misc
 
@@ -323,7 +323,7 @@ enum ProjectType: String, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// Item kinds listed under this type's sidebar section.
+    /// Item kinds that belong to this type.
     var kinds: [ItemKind] {
         switch self {
         case .research: [.coding, .experiment, .writing, .reading, .task]
