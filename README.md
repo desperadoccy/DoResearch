@@ -24,9 +24,19 @@ Headless checks for the data layer and agent tools:
 - **Items** have a *kind*: Coding, Experiment, Writing, Reading, Task, Personal, Misc. Statuses are shared but named per kind — an experiment is *Planned → Running → Analyzing → Concluded*; coding is *To Do → In Development → In Review → Merged*.
 - **Experiments** track hypothesis, setup, compute, run start/end (timed automatically when the status changes), metrics, results, outcome (supported / refuted / inconclusive / failed), and conclusion.
 - **Coding items** track repo, branch, PR/issue link, and a checklist of implementation steps with progress.
+- **Measurable progress**: any item can count toward a target (see below), so "read ten papers" is one item at *4/10 papers*, not ten items.
 - **Projects** group items and come in three types (see below).
 - **Progress log**: every status change and note is timestamped per item; changes made by the assistant are marked as such.
 - **Review** dashboard (⌘4): completed/added counts, experiments by phase, active coding, blocked/overdue/stale work, per-project progress, and an activity timeline over 7/14/30 days.
+
+## Progress toward a target
+
+Some work is measured in units: papers to read, pages to write, runs to finish. Turn on **Track progress toward a target** in an item's detail panel and set the target and a unit (e.g. 10 papers). The item then shows *4/10 papers* with a small bar.
+
+- **Update it in place**: click − or + on the list row or board card, use **Progress +1 / −1** in the context menu, or type the exact number in the detail panel.
+- **Status follows the count**: the first step moves the item to In Progress, reaching the target marks it Done, and going back below the target reopens it. Changing the status yourself always wins.
+- **History stays readable**: steps within five minutes are saved as one log entry, e.g. *Progress 3 → 7/10 papers*.
+- **The assistant uses it too**: "I read two more papers" adds to the existing item instead of creating new ones.
 
 ## Projects
 
