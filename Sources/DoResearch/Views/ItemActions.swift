@@ -192,6 +192,11 @@ struct ItemContextMenu: View {
                     }
                 }
             }
+            if items.count == 1, let item = items.first, item.tracksProgress {
+                Button("Progress +1 (\(item.progressLabel))") { store.stepProgress(item.id, by: 1) }
+                Button("Progress −1") { store.stepProgress(item.id, by: -1) }
+                    .disabled(item.progressCurrent == 0)
+            }
             let allToday = items.allSatisfy(\.flaggedToday)
             Button(allToday ? "Remove from Today" : "Add to Today") {
                 mutate(items) { Placement(today: !allToday).apply(to: &$0) }
@@ -244,7 +249,7 @@ struct MultiSelectionView: View {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(items.prefix(8)) { item in
                     Label {
-                        Text(item.title).lineLimit(1)
+                        Text(item.title).lineLimit(2)
                     } icon: {
                         Image(systemName: item.kind.symbol).foregroundStyle(item.kind.color)
                     }

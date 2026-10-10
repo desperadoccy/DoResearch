@@ -19,7 +19,8 @@ struct ItemTransfer: Codable, Transferable {
     }
 
     var plainText: String {
-        items.map { "- [\($0.status == .done ? "x" : " ")] \($0.title)" }.joined(separator: "\n")
+        items.map { "- [\($0.status == .done ? "x" : " ")] \($0.title)" + ($0.tracksProgress ? " (\($0.progressLabel))" : "") }
+            .joined(separator: "\n")
     }
 
     /// One item per non-empty line. Understands Markdown bullets, numbered lists, and `[ ]`/`[x]` checkboxes.

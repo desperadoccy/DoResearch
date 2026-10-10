@@ -290,9 +290,9 @@ struct ItemRow: View {
                     Text(item.title)
                         .strikethrough(item.status == .dropped)
                         .foregroundStyle(item.status.isOpen ? .primary : .secondary)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                HStack(spacing: 8) {
+                FlowLayout(spacing: 8, lineSpacing: 4) {
                     KindBadge(kind: item.kind)
                     if item.status != .todo && item.status != .done {
                         Text(item.statusLabel)
@@ -306,7 +306,6 @@ struct ItemRow: View {
                         Label(p.name, systemImage: p.symbol)
                             .font(.caption)
                             .foregroundStyle(p.swiftColor)
-                            .lineLimit(1)
                     }
                     if let due = item.dueDate {
                         Label(due.formatted(.relative(presentation: .named)), systemImage: "calendar")
@@ -325,6 +324,9 @@ struct ItemRow: View {
 
     @ViewBuilder
     private var detailLine: some View {
+        if item.tracksProgress {
+            ProgressStepper(item: item)
+        }
         let progress = item.checklistProgress
         if progress.total > 0 {
             Label("\(progress.done)/\(progress.total)", systemImage: "checklist")
@@ -340,7 +342,6 @@ struct ItemRow: View {
             Label(item.branch, systemImage: "arrow.triangle.branch")
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
         default:
             EmptyView()
         }
@@ -460,7 +461,7 @@ struct BoardView: View {
         let payload = actions.dragPayload(for: item, in: items)
         let selected = app.selectedItemIDs.contains(item.id)
         return VStack(alignment: .leading, spacing: 6) {
-            Text(item.title).font(.body).lineLimit(3)
+            Text(item.title).font(.body).fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 6) {
                 KindBadge(kind: item.kind)
                 if let p = store.project(item.projectID) {
@@ -470,6 +471,9 @@ struct BoardView: View {
                 if item.kind == .experiment, item.outcome != .pending {
                     Image(systemName: item.outcome.symbol).foregroundStyle(item.outcome.color).font(.caption)
                 }
+            }
+            if item.tracksProgress {
+                ProgressStepper(item: item)
             }
             let progress = item.checklistProgress
             if progress.total > 0 {
@@ -509,5 +513,88 @@ struct BoardView: View {
         .contextMenu {
             ItemContextMenu(ids: selected ? app.selectedItemIDs : [item.id])
         }
+    }
+}
+
+// MARK: - Progress
+
+/// An item's count with − and + around it, so progress can be logged straight from a list or board.
+struct ProgressStepper: View {
+    let item: Item
+    @Environment(Store.self) private var store
+
+    var body: some View {
+        let target = Double(item.progressTarget ?? 1)
+        HStack(spacing: 4) {
+            Button {
+                store.stepProgress(item.id, by: -1)
+            } label: {
+                Image(systemName: "minus.circle")
+            }
+            .disabled(item.progressCurrent == 0)
+            .help("One less")
+            ProgressView(value: min(Double(item.progressCurrent), target), total: target)
+                .progressViewStyle(.linear)
+                .controlSize(.mini)
+                .tint(item.progressCurrent >= Int(target) ? .green : item.kind.color)
+                .frame(width: 40)
+            Text(item.progressLabel)
+                .monospacedDigit()
+                .fixedSize()
+            Button {
+                store.stepProgress(item.id, by: 1)
+            } label: {
+                Image(systemName: "plus.circle")
+            }
+            .help("One more")
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+}
+
+/// Lays children out left to right and wraps them onto new lines instead of truncating them.
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+    var lineSpacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        arrange(width: proposal.width ?? .infinity, subviews).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for (view, frame) in zip(subviews, arrange(width: bounds.width, subviews).frames) {
+            view.place(at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY), proposal: ProposedViewSize(frame.size))
+        }
+    }
+
+    /// Frames line by line, each child centered vertically within its line.
+    private func arrange(width maxWidth: CGFloat, _ subviews: Subviews) -> (frames: [CGRect], size: CGSize) {
+        var lines: [[(index: Int, size: CGSize)]] = [[]]
+        var x: CGFloat = 0
+        for (index, view) in subviews.enumerated() {
+            var size = view.sizeThatFits(.unspecified)
+            if size.width > maxWidth { size = view.sizeThatFits(ProposedViewSize(width: maxWidth, height: nil)) }
+            if x > 0, x + size.width > maxWidth {
+                lines.append([])
+                x = 0
+            }
+            lines[lines.count - 1].append((index, size))
+            x += size.width + spacing
+        }
+        var frames = Array(repeating: CGRect.zero, count: subviews.count)
+        var y: CGFloat = 0, width: CGFloat = 0
+        for line in lines where !line.isEmpty {
+            let height = line.map(\.size.height).max() ?? 0
+            var x: CGFloat = 0
+            for entry in line {
+                frames[entry.index] = CGRect(origin: CGPoint(x: x, y: y + (height - entry.size.height) / 2), size: entry.size)
+                x += entry.size.width + spacing
+            }
+            width = max(width, x - spacing)
+            y += height + lineSpacing
+        }
+        return (frames, CGSize(width: width, height: max(y - lineSpacing, 0)))
     }
 }

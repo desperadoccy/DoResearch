@@ -140,8 +140,10 @@ final class Store {
         let old = items[index]
         var item = updated
         item.position = old.position // ordering changes only through reorder(), so stale copies can't undo a drag
+        Self.normalizeProgress(&item)
         guard old != item else { return }
         item.updatedAt = Date()
+        if old.status == item.status { Self.followProgress(old, &item) }
 
         if old.kind != .experiment, item.kind == .experiment, item.status == .inProgress, item.runStartedAt == nil {
             item.runStartedAt = Date()
@@ -168,6 +170,9 @@ final class Store {
                 log(item: item.id, project: item.projectID, kind: "status",
                     text: "\(old.status.label(for: item.kind)) → \(item.status.label(for: item.kind))", author: author)
             }
+            if old.progressCurrent != item.progressCurrent, item.tracksProgress {
+                logProgress(from: old, to: item, author: author)
+            }
             if author == .agent {
                 let changed = Self.changedFields(old, item).filter { $0 != "status" }
                 if !changed.isEmpty {
@@ -177,6 +182,53 @@ final class Store {
             }
         } catch {
             report(error)
+        }
+    }
+
+    /// Moves a tracked count by `delta` (never below zero; it may pass the target).
+    func stepProgress(_ id: String, by delta: Int, author: Author = .user) {
+        guard var item = item(id), item.tracksProgress else { return }
+        item.progressCurrent += delta
+        updateItem(item, author: author)
+    }
+
+    private static func normalizeProgress(_ item: inout Item) {
+        if let target = item.progressTarget { item.progressTarget = max(target, 1) }
+        item.progressCurrent = max(item.progressCurrent, 0)
+        item.progressUnit = item.progressUnit.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// When only the count or target moved, status follows: the first step starts the item, reaching the target
+    /// finishes it, and falling back below the target reopens it. An explicit status change in the same edit wins.
+    private static func followProgress(_ old: Item, _ item: inout Item) {
+        guard let target = item.progressTarget,
+              old.progressCurrent != item.progressCurrent || old.progressTarget != item.progressTarget else { return }
+        let wasComplete = old.progressTarget.map { old.progressCurrent >= $0 } ?? false
+        if item.progressCurrent >= target {
+            if !wasComplete, item.status.isOpen { item.status = .done }
+        } else if wasComplete, item.status == .done {
+            item.status = .inProgress
+        } else if old.progressCurrent == 0, item.progressCurrent > 0, item.status == .todo || item.status == .inbox {
+            item.status = .inProgress
+        }
+    }
+
+    /// Count changes by the same author within five minutes share one log entry ("Progress 3 → 7/10 papers")
+    /// instead of logging every click.
+    @ObservationIgnored private var recentProgressLog: [String: (logID: String, from: Int, author: Author, at: Date)] = [:]
+
+    private func logProgress(from old: Item, to item: Item, author: Author) {
+        let now = Date()
+        var start = old.progressCurrent
+        if let recent = recentProgressLog.removeValue(forKey: item.id), recent.author == author, now.timeIntervalSince(recent.at) < 300 {
+            start = recent.from
+            try? db.execute("DELETE FROM logs WHERE id = ?", [recent.logID])
+            logRevision += 1
+        }
+        guard start != item.progressCurrent else { return }
+        if let id = log(item: item.id, project: item.projectID, kind: "progress",
+                        text: "Progress \(start) → \(item.progressLabel)", author: author) {
+            recentProgressLog[item.id] = (id, start, author, now)
         }
     }
 
@@ -426,15 +478,19 @@ final class Store {
 
     // MARK: Activity log
 
-    func log(item: String?, project: String?, kind: String, text: String, author: Author) {
+    @discardableResult
+    func log(item: String?, project: String?, kind: String, text: String, author: Author) -> String? {
+        let id = ShortID.make(12)
         do {
             try db.execute(
                 "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at) VALUES (?,?,?,?,?,?,?)",
-                [ShortID.make(12), item, project, kind, text, author.rawValue, Date()]
+                [id, item, project, kind, text, author.rawValue, Date()]
             )
             logRevision += 1
+            return id
         } catch {
             report(error)
+            return nil
         }
     }
 
@@ -471,6 +527,7 @@ final class Store {
         "id", "title", "notes", "kind", "status", "priority", "project_id", "tags", "due_date", "flagged_today",
         "created_at", "updated_at", "completed_at", "repo", "branch", "link", "hypothesis", "setup", "compute",
         "results", "conclusion", "outcome", "metrics", "run_started_at", "run_ended_at", "position",
+        "progress_current", "progress_target", "progress_unit",
     ]
 
     private static func placeholders(_ n: Int) -> String { Array(repeating: "?", count: n).joined(separator: ",") }
@@ -483,7 +540,7 @@ final class Store {
         [i.id, i.title, i.notes, i.kind.rawValue, i.status.rawValue, i.priority.rawValue, i.projectID, json(i.tags),
          i.dueDate, i.flaggedToday, i.createdAt, i.updatedAt, i.completedAt, i.repo, i.branch, i.link, i.hypothesis,
          i.setup, i.compute, i.results, i.conclusion, i.outcome.rawValue, json(i.metrics), i.runStartedAt, i.runEndedAt,
-         i.position]
+         i.position, i.progressCurrent, i.progressTarget, i.progressUnit]
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, _ s: String?, default value: T) -> T {
@@ -518,7 +575,10 @@ final class Store {
             outcome: ExperimentOutcome(rawValue: r["outcome"]?.string ?? "") ?? .pending,
             metrics: decode([Metric].self, r["metrics"]?.string, default: []),
             runStartedAt: r["run_started_at"]?.date,
-            runEndedAt: r["run_ended_at"]?.date
+            runEndedAt: r["run_ended_at"]?.date,
+            progressCurrent: r["progress_current"]?.int ?? 0,
+            progressTarget: r["progress_target"]?.int,
+            progressUnit: r["progress_unit"]?.string ?? ""
         )
     }
 
@@ -550,6 +610,7 @@ final class Store {
         check("hypothesis", \.hypothesis); check("setup", \.setup); check("compute", \.compute); check("results", \.results)
         check("conclusion", \.conclusion); check("outcome", \.outcome); check("metrics", \.metrics)
         check("run start", \.runStartedAt); check("run end", \.runEndedAt)
+        check("progress target", \.progressTarget); check("progress unit", \.progressUnit)
         return out
     }
 }

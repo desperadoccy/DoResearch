@@ -59,6 +59,10 @@ struct AgentTools {
             ],
             "run_started_at": str("Experiment: ISO 8601 datetime, 'now', or empty string to clear."),
             "run_ended_at": str("Experiment: ISO 8601 datetime, 'now', or empty string to clear."),
+            "progress_target": ["type": "integer", "description": "Track measurable progress toward this count (e.g. 10 for 'read ten papers'). 0 stops tracking. Use this instead of creating one item per unit."],
+            "progress_unit": str("Unit for the count, plural (e.g. 'papers', 'pages', 'km')."),
+            "progress": ["type": "integer", "description": "Set the current count. Reaching the target marks the item done."],
+            "progress_add": ["type": "integer", "description": "Add to the current count (negative to subtract). Prefer this when the user reports new progress, e.g. 'read two more'."],
         ]
     }
 
@@ -294,6 +298,14 @@ struct AgentTools {
         case .clear: item.runEndedAt = nil
         case .absent: break
         }
+        if let v = try a.int("progress_target") { item.progressTarget = v > 0 ? v : nil }
+        if let v = try a.string("progress_unit") { item.progressUnit = v }
+        let current = try a.int("progress"), delta = try a.int("progress_add")
+        if current != nil || delta != nil {
+            guard item.tracksProgress else { throw ToolInputError(message: "Set progress_target before reporting progress on this item.") }
+            if let current { item.progressCurrent = current }
+            if let delta { item.progressCurrent += delta }
+        }
     }
 
     private func updateChecklist(_ a: Args) throws -> ToolOutcome {
@@ -444,6 +456,7 @@ struct AgentTools {
         if !i.tags.isEmpty { d["tags"] = i.tags }
         let pr = i.checklistProgress
         if pr.total > 0 { d["checklist"] = "\(pr.done)/\(pr.total)" }
+        if i.tracksProgress { d["progress"] = i.progressLabel }
         if i.kind == .experiment, i.outcome != .pending { d["outcome"] = i.outcome.rawValue }
         if let done = i.completedAt { d["closed"] = day(done) }
         if !i.notes.isEmpty { d["notes_preview"] = String(i.notes.prefix(160)) }

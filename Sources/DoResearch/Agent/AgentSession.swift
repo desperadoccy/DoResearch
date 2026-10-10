@@ -216,6 +216,9 @@ final class AgentSession {
     inbox means not yet triaged; dropped replaces deletion.
     - Experiments carry hypothesis, setup, compute, run times, metrics, results, an outcome (pending/supported/refuted/\
     inconclusive/failed), and a conclusion. Coding items carry repo, branch, a PR/issue link, and a checklist of implementation steps.
+    - Any item can track a measurable count toward a target (progress_target, progress_unit), e.g. "read 10 papers" is one \
+    item at 0/10 papers. When the user reports progress on such work ("read two more"), use progress_add on the existing \
+    item rather than creating new items. Reaching the target marks it done.
     - Projects group items and have a type. research projects are papers, research threads, or systems, and hold \
     coding, experiment, writing, reading, and task items. personal projects are areas or efforts in the user's life \
     (health, finances, a trip, a move) and hold personal items. misc projects group everything else (errands, admin, \

@@ -218,10 +218,24 @@ struct Item: Identifiable, Hashable, Codable {
 
     var checklist: [ChecklistEntry] = []
 
+    // Measurable progress, e.g. 4 of 10 papers read. Tracked only while a target is set.
+    var progressCurrent = 0
+    var progressTarget: Int?
+    var progressUnit = ""
+
     var statusLabel: String { status.label(for: kind) }
 
     var checklistProgress: (done: Int, total: Int) {
         (checklist.filter(\.done).count, checklist.count)
+    }
+
+    var tracksProgress: Bool { progressTarget != nil }
+
+    /// "4/10 papers"
+    var progressLabel: String {
+        guard let progressTarget else { return "" }
+        let unit = progressUnit.trimmingCharacters(in: .whitespaces)
+        return "\(progressCurrent)/\(progressTarget)" + (unit.isEmpty ? "" : " \(unit)")
     }
 
     var isOverdue: Bool {

@@ -85,7 +85,7 @@ struct ItemDetailView: View {
             TextField("Title", text: bind(item, \.title), prompt: Text("Title"), axis: .vertical)
                 .font(.title2.weight(.semibold))
                 .textFieldStyle(.plain)
-                .lineLimit(1...4)
+                .lineLimit(1...)
             HStack(spacing: 8) {
                 KindBadge(kind: item.kind)
                 Text(item.statusLabel).font(.caption).foregroundStyle(item.status.color)
@@ -140,6 +140,8 @@ struct ItemDetailView: View {
             case .experiment: experimentSections(item)
             default: EmptyView()
             }
+
+            progressSection(item)
 
             checklistSection(item)
 
@@ -276,6 +278,63 @@ struct ItemDetailView: View {
         )
     }
 
+    // MARK: Progress
+
+    private func progressSection(_ item: Item) -> some View {
+        Section {
+            Toggle("Track progress toward a target", isOn: Binding(
+                get: { item.tracksProgress },
+                set: { on in
+                    guard var copy = store.item(itemID) else { return }
+                    copy.progressTarget = on ? (copy.progressTarget ?? 10) : nil
+                    store.updateItem(copy)
+                }
+            ))
+            if item.tracksProgress {
+                LabeledContent("Done so far") {
+                    HStack {
+                        TextField("Done", value: bind(item, \.progressCurrent), format: .number)
+                            .labelsHidden()
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 70)
+                        Stepper("Done", value: bind(item, \.progressCurrent), in: 0...Int.max).labelsHidden()
+                    }
+                }
+                LabeledContent("Target") {
+                    TextField("Target", value: Binding(
+                        get: { (store.item(itemID) ?? item).progressTarget ?? 1 },
+                        set: { value in
+                            guard var copy = store.item(itemID) else { return }
+                            copy.progressTarget = value
+                            store.updateItem(copy)
+                        }
+                    ), format: .number)
+                    .labelsHidden()
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 70)
+                }
+                TextField("Unit", text: bind(item, \.progressUnit), prompt: Text("e.g. papers, pages, chapters"))
+            }
+        } header: {
+            HStack {
+                Text("Progress")
+                Spacer()
+                if let target = item.progressTarget {
+                    ProgressView(value: min(Double(item.progressCurrent), Double(target)), total: Double(target))
+                        .frame(width: 80)
+                        .controlSize(.small)
+                    Text(item.progressLabel).monospacedDigit()
+                }
+            }
+        } footer: {
+            if item.tracksProgress {
+                Text("Reaching the target marks the item done. Use − and + in the list to log progress without opening it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     // MARK: Checklist
 
     private func checklistSection(_ item: Item) -> some View {
@@ -289,7 +348,7 @@ struct ItemDetailView: View {
                         TextField("Step", text: Binding(
                             get: { entry.title },
                             set: { var e = entry; e.title = $0; store.updateChecklistEntry(e) }
-                        ))
+                        ), axis: .vertical)
                         .textFieldStyle(.plain)
                         .labelsHidden()
                         .strikethrough(entry.done)
@@ -427,6 +486,7 @@ struct LogRow: View {
         case "created": return "plus.circle"
         case "status": return "arrow.right.circle"
         case "note": return "text.bubble"
+        case "progress": return "chart.line.uptrend.xyaxis"
         default: return "pencil.circle"
         }
     }

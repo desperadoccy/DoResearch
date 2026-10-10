@@ -212,9 +212,9 @@ struct ReviewItemLine<Accessory: View>: View {
             app.selection = .kind(item.kind)
             app.selectedItemID = item.id
         } label: {
-            HStack(spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Image(systemName: item.kind.symbol).foregroundStyle(item.kind.color).frame(width: 16)
-                Text(item.title).lineLimit(1)
+                Text(item.title).fixedSize(horizontal: false, vertical: true)
                 if let p = store.project(item.projectID) {
                     Text(p.name).foregroundStyle(.tertiary).lineLimit(1)
                 }

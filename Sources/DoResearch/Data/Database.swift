@@ -230,5 +230,16 @@ final class Database {
                 try execute("PRAGMA user_version = 3")
             }
         }
+        if version < 4 {
+            try transaction {
+                let columns = try query("PRAGMA table_info(items)").compactMap { $0["name"]?.string }
+                if !columns.contains("progress_current") {
+                    try execute("ALTER TABLE items ADD COLUMN progress_current INTEGER NOT NULL DEFAULT 0")
+                    try execute("ALTER TABLE items ADD COLUMN progress_target INTEGER")
+                    try execute("ALTER TABLE items ADD COLUMN progress_unit TEXT NOT NULL DEFAULT ''")
+                }
+                try execute("PRAGMA user_version = 4")
+            }
+        }
     }
 }

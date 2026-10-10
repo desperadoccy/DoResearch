@@ -204,6 +204,50 @@ struct ToolHarness {
         expect(Store(url: url4).project("old")?.type == .research, "v2 → v3 makes existing projects research projects")
         try? FileManager.default.removeItem(at: url4)
 
+        // MARK: Measurable progress lives on one item instead of one item per unit.
+        let reading = call("create_item", ["title": "Read ten papers on sparse attention", "kind": "reading",
+                                           "progress_target": 10, "progress_unit": "papers"])
+        let rid = ((reading["created"] as? [String: Any])?["id"] as? String) ?? ""
+        expect((reading["created"] as? [String: Any])?["progress"] as? String == "0/10 papers", "item tracks 0/10 papers")
+        _ = call("update_item", ["id": rid, "progress_add": 3])
+        expect(store.item(rid)?.progressCurrent == 3 && store.item(rid)?.status == .inProgress, "first progress starts the item")
+        _ = call("update_item", ["id": rid, "progress_add": 2])
+        let agentLogs = store.logs(forItem: rid).filter { $0.kind == "progress" }
+        expect(agentLogs.count == 1 && agentLogs.first?.text == "Progress 0 → 5/10 papers", "quick successive updates share one log entry")
+        store.stepProgress(rid, by: 5)
+        expect(store.item(rid)?.status == .done, "reaching the target marks it done")
+        expect(store.logs(forItem: rid).filter { $0.kind == "progress" }.count == 2, "a different author starts a new log entry")
+        store.stepProgress(rid, by: -1)
+        expect(store.item(rid)?.status == .inProgress && store.item(rid)?.progressCurrent == 9, "stepping back below the target reopens it")
+        store.stepProgress(rid, by: -20)
+        expect(store.item(rid)?.progressCurrent == 0, "count never goes below zero")
+        let plain = store.createItem(Item(id: "", title: "Untracked task"))
+        let untracked = call("update_item", ["id": plain.id, "progress_add": 1])
+        expect(untracked["error"] != nil && store.item(plain.id)?.progressCurrent == 0, "progress needs a target first")
+        _ = call("update_item", ["id": rid, "progress_target": 0])
+        expect(store.item(rid)?.tracksProgress == false, "target 0 stops tracking")
+
+        // MARK: Migration from schema v3 adds progress columns.
+        let url5 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("dr-harness-\(UUID().uuidString).sqlite")
+        do {
+            let db = try Database(url: url5)
+            for column in ["progress_current", "progress_target", "progress_unit"] {
+                try db.execute("ALTER TABLE items DROP COLUMN \(column)")
+            }
+            try db.execute("PRAGMA user_version = 3")
+            let now = Date().timeIntervalSince1970
+            try db.execute("INSERT INTO items (id, title, kind, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                           ["old", "Old item", "task", "todo", now, now])
+        } catch { expect(false, "set up v3 database: \(error)") }
+        let s5 = Store(url: url5)
+        expect(s5.item("old")?.tracksProgress == false && s5.item("old")?.progressCurrent == 0, "v3 → v4 leaves items untracked")
+        var tracked = s5.item("old")!
+        tracked.progressTarget = 4
+        tracked.progressUnit = "chapters"
+        s5.updateItem(tracked)
+        expect(Store(url: url5).item("old")?.progressLabel == "0/4 chapters", "progress persists")
+        try? FileManager.default.removeItem(at: url5)
+
         await ProviderHarness.run(expect: expect)
 
         print(failures == 0 ? "\nAll checks passed." : "\n\(failures) check(s) failed.")
