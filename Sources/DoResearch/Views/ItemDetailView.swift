@@ -133,6 +133,15 @@ struct ItemDetailView: View {
                 Toggle("Show in Today", isOn: bind(item, \.flaggedToday))
                 TextField("Tags", text: $tagText, prompt: Text("comma, separated"))
                     .onSubmit(commitTags)
+                if !item.chatIDs.isEmpty {
+                    LabeledContent("Linked chats") {
+                        Text(item.chatIDs.joined(separator: "\n"))
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    .help("Set by external chats through the local API")
+                }
             }
 
             switch item.kind {
@@ -464,7 +473,7 @@ struct LogRow: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: symbol)
-                .foregroundStyle(entry.author == .agent ? Color.purple : Color.secondary)
+                .foregroundStyle(entry.author == .agent ? Color.purple : entry.author == .api ? Color.teal : Color.secondary)
                 .frame(width: 16)
             VStack(alignment: .leading, spacing: 2) {
                 if let itemTitle {
@@ -473,15 +482,24 @@ struct LogRow: View {
                 Text(entry.text)
                     .foregroundStyle(entry.kind == "note" ? .primary : .secondary)
                     .textSelection(.enabled)
-                Text("\(entry.author == .agent ? "Assistant · " : "")\(entry.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                Text(byline + entry.createdAt.formatted(date: .abbreviated, time: .shortened))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
         }
     }
 
+    private var byline: String {
+        switch entry.author {
+        case .user: ""
+        case .agent: "Assistant · "
+        case .api: entry.sourceChatID.map { "API · chat \($0) · " } ?? "API · "
+        }
+    }
+
     private var symbol: String {
         if entry.author == .agent { return "sparkles" }
+        if entry.author == .api { return "link" }
         switch entry.kind {
         case "created": return "plus.circle"
         case "status": return "arrow.right.circle"

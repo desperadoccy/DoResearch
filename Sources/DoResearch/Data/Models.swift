@@ -162,7 +162,8 @@ enum ExperimentOutcome: String, CaseIterable, Identifiable, Codable {
 }
 
 enum Author: String, Codable {
-    case user, agent
+    /// `api` marks changes made by external clients through the local API (see docs/API.md).
+    case user, agent, api
 }
 
 // MARK: - Records
@@ -217,6 +218,11 @@ struct Item: Identifiable, Hashable, Codable {
     var runEndedAt: Date?
 
     var checklist: [ChecklistEntry] = []
+
+    /// Bumped on every saved change to the item's content, so API clients can detect edits made since they read it.
+    var revision = 1
+    /// Ids of external chats (e.g. Codex conversations) working on this item. Set through the local API.
+    var chatIDs: [String] = []
 
     // Measurable progress, e.g. 4 of 10 papers read. Tracked only while a target is set.
     var progressCurrent = 0
@@ -435,6 +441,9 @@ struct LogEntry: Identifiable, Hashable {
     var text: String
     var author: Author
     var createdAt: Date
+    /// Set for entries appended through the local API.
+    var sourceChatID: String?
+    var idempotencyKey: String?
 }
 
 extension Color {

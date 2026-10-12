@@ -248,6 +248,7 @@ struct ToolHarness {
         expect(Store(url: url5).item("old")?.progressLabel == "0/4 chapters", "progress persists")
         try? FileManager.default.removeItem(at: url5)
 
+        await APIHarness.run(expect: expect)
         await ProviderHarness.run(expect: expect)
 
         print(failures == 0 ? "\nAll checks passed." : "\n\(failures) check(s) failed.")

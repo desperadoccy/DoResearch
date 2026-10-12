@@ -5,6 +5,8 @@ struct SettingsView: View {
         TabView {
             ProvidersSettings()
                 .tabItem { Label("Providers", systemImage: "cpu") }
+            APISettings()
+                .tabItem { Label("API", systemImage: "point.3.connected.trianglepath.dotted") }
             GeneralSettings()
                 .tabItem { Label("General", systemImage: "gearshape") }
         }
@@ -28,6 +30,87 @@ private struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+// MARK: - Local API
+
+private struct APISettings: View {
+    @Environment(APIServer.self) private var server
+    @State private var portText = ""
+    @State private var revealToken = false
+    @State private var confirmingRegenerate = false
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Enable local API", isOn: Binding(get: { server.enabled }, set: { server.setEnabled($0) }))
+                LabeledContent("Status") { statusText }
+                HStack {
+                    TextField("Port", text: $portText, prompt: Text(String(APIServer.defaultPort)))
+                        .onSubmit(applyPort)
+                    Button("Apply", action: applyPort)
+                        .disabled(Int(portText) == server.port || !(1024...65535).contains(Int(portText) ?? 0))
+                }
+            } footer: {
+                Text("Lets local tools such as Codex read and update tasks while DoResearch is open. Listens on 127.0.0.1 only; every request needs the token below.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Connection") {
+                LabeledContent("Base URL") {
+                    Text(server.baseURL).font(.body.monospaced()).textSelection(.enabled)
+                }
+                LabeledContent("Token") {
+                    HStack {
+                        Text(revealToken ? server.token : String(repeating: "•", count: 16))
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button(revealToken ? "Hide" : "Show") { revealToken.toggle() }
+                        Button("Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(server.token, forType: .string)
+                        }
+                    }
+                }
+                .disabled(server.token.isEmpty)
+                LabeledContent("Connection file") {
+                    Text(server.connectionFileURL.path)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                }
+                HStack {
+                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([server.connectionFileURL]) }
+                        .disabled(server.token.isEmpty)
+                    Spacer()
+                    Button("Regenerate Token…") { confirmingRegenerate = true }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear { portText = String(server.port) }
+        .confirmationDialog("Regenerate the API token?", isPresented: $confirmingRegenerate) {
+            Button("Regenerate", role: .destructive) { server.regenerateToken() }
+        } message: {
+            Text("Clients using the current token will get “unauthorized” until they read the new one.")
+        }
+    }
+
+    @ViewBuilder private var statusText: some View {
+        switch server.state {
+        case .stopped: Text("Off").foregroundStyle(.secondary)
+        case .starting: Text("Starting…").foregroundStyle(.secondary)
+        case .running: Label("Running", systemImage: "circle.fill").foregroundStyle(.green)
+        case .failed(let message): Text(message).foregroundStyle(.red)
+        }
+    }
+
+    private func applyPort() {
+        guard let p = Int(portText), (1024...65535).contains(p) else { return }
+        server.setPort(p)
     }
 }
 

@@ -241,5 +241,21 @@ final class Database {
                 try execute("PRAGMA user_version = 4")
             }
         }
+        if version < 5 {
+            try transaction {
+                let columns = try query("PRAGMA table_info(items)").compactMap { $0["name"]?.string }
+                if !columns.contains("revision") {
+                    try execute("ALTER TABLE items ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+                    try execute("ALTER TABLE items ADD COLUMN chat_ids TEXT NOT NULL DEFAULT '[]'")
+                }
+                let logColumns = try query("PRAGMA table_info(logs)").compactMap { $0["name"]?.string }
+                if !logColumns.contains("idempotency_key") {
+                    try execute("ALTER TABLE logs ADD COLUMN source_chat_id TEXT")
+                    try execute("ALTER TABLE logs ADD COLUMN idempotency_key TEXT")
+                }
+                try execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_logs_idempotency ON logs(idempotency_key)")
+                try execute("PRAGMA user_version = 5")
+            }
+        }
     }
 }
