@@ -102,6 +102,19 @@ final class Store {
     /// otherwise from `draft.checklist` (keeping their done state, as when duplicating).
     @discardableResult
     func createItem(_ draft: Item, checklist: [String] = [], author: Author = .user, logText: String? = nil) -> Item {
+        do {
+            return try insertItem(draft, checklist: checklist, author: author, logText: logText)
+        } catch {
+            report(error)
+            return draft
+        }
+    }
+
+    /// `createItem` for callers that need to know whether the write reached the database. The item and its
+    /// "created" log entry are saved together, so an `idempotencyKey` on that entry is never left without its item.
+    @discardableResult
+    func insertItem(_ draft: Item, checklist: [String] = [], author: Author = .user, logText: String? = nil,
+                    sourceChatID: String? = nil, idempotencyKey: String? = nil) throws -> Item {
         var item = draft
         if item.id.isEmpty || self.item(item.id) != nil { item.id = uniqueItemID() }
         let now = Date()
@@ -114,25 +127,30 @@ final class Store {
         if item.kind == .experiment, item.status == .inProgress, item.runStartedAt == nil { item.runStartedAt = now }
         let steps = checklist.isEmpty ? draft.checklist.map { ($0.title, $0.done) } : checklist.map { ($0, false) }
         item.checklist = []
-        do {
-            try db.transaction {
-                try db.execute(
-                    "INSERT INTO items (\(Self.itemColumns.joined(separator: ","))) VALUES (\(Self.placeholders(Self.itemColumns.count)))",
-                    Self.itemParams(item)
-                )
-                for (i, step) in steps.enumerated() {
-                    let entry = ChecklistEntry(id: ShortID.make(10), itemID: item.id, title: step.0, done: step.1, position: i)
-                    try insertChecklist(entry)
-                    item.checklist.append(entry)
-                }
+        let text = logText ?? "Created \(item.kind.label.lowercased()) “\(item.title)”"
+        try db.transaction {
+            try db.execute(
+                "INSERT INTO items (\(Self.itemColumns.joined(separator: ","))) VALUES (\(Self.placeholders(Self.itemColumns.count)))",
+                Self.itemParams(item)
+            )
+            for (i, step) in steps.enumerated() {
+                let entry = ChecklistEntry(id: ShortID.make(10), itemID: item.id, title: step.0, done: step.1, position: i)
+                try insertChecklist(entry)
+                item.checklist.append(entry)
             }
-            items.append(item)
-            log(item: item.id, project: item.projectID, kind: "created",
-                text: logText ?? "Created \(item.kind.label.lowercased()) “\(item.title)”", author: author)
-        } catch {
-            report(error)
+            try db.execute(
+                "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
+                [ShortID.make(12), item.id, item.projectID, "created", text, author.rawValue, now, sourceChatID, idempotencyKey]
+            )
         }
+        items.append(item)
+        logRevision += 1
         return item
+    }
+
+    /// The log entry stored under an idempotency key, if any.
+    func logEntry(idempotencyKey: String) throws -> LogEntry? {
+        try db.query("SELECT * FROM logs WHERE idempotency_key = ?", [idempotencyKey]).first.map(Self.log(from:))
     }
 
     /// Persists `updated`. Status transitions are timestamped and logged; agent and API edits are always logged.

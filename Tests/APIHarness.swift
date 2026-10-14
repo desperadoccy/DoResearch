@@ -103,6 +103,56 @@ enum APIHarness {
         let log = (call("GET", "/v1/tasks/\(exp.id)").1["task"] as? [String: Any])?["progress_log"] as? [[String: Any]]
         expect(log?.first?["source_chat_id"] as? String == "codex-1" && log?.first?["author"] as? String == "api", "log entry keeps its source chat")
 
+        // Creating
+        let personal = store.createProject(Project(id: "", name: "Health", type: .personal))
+        let newTask: [String: Any] = [
+            "fields": ["title": "  Sweep lr 1e-4..1e-3 ", "project_id": project.id, "status": "Running", "setup": "5 seeds",
+                       "chat_ids": ["codex-2"], "metrics": [["name": "lr", "value": 0.0003]]],
+            "source_chat_id": "codex-2", "idempotency_key": "codex-2/create-1",
+        ]
+        let (createStatus, created) = call("POST", "/v1/tasks", body: newTask)
+        let ct = created["task"] as? [String: Any] ?? [:]
+        let newID = ct["id"] as? String ?? ""
+        expect(createStatus == 201 && created["duplicate"] as? Bool == false && ct["title"] as? String == "Sweep lr 1e-4..1e-3"
+               && ct["kind"] as? String == "experiment" && ct["status"] as? String == "Running" && ct["revision"] as? Int == 1,
+               "create_task → 201 with saved task at revision 1")
+        expect(ct["run_started_at"] is String && ct["chat_ids"] as? [String] == ["codex-2"] && ct["setup"] as? String == "5 seeds",
+               "created running experiment gets a run start, chat link, and fields")
+        let createdLog = (ct["progress_log"] as? [[String: Any]])?.first
+        expect(createdLog?["kind"] as? String == "created" && createdLog?["author"] as? String == "api"
+               && createdLog?["source_chat_id"] as? String == "codex-2", "creation logged with author api and source chat")
+        expect(store.item(newID)?.projectID == project.id, "created task is in the store the UI reads")
+
+        var renamed = store.item(newID)!
+        renamed.title = "Renamed in the app"
+        store.updateItem(renamed)
+        let (replayCreateStatus, replayCreate) = call("POST", "/v1/tasks", body: newTask)
+        expect(replayCreateStatus == 200 && replayCreate["duplicate"] as? Bool == true
+               && (replayCreate["task"] as? [String: Any])?["id"] as? String == newID, "replayed create returns the same task, even after edits")
+        expect(store.items.filter { $0.chatIDs.contains("codex-2") }.count == 1, "no duplicate task created")
+        let otherTitle = call("POST", "/v1/tasks", body: ["fields": ["title": "Other"], "source_chat_id": "codex-2", "idempotency_key": "codex-2/create-1"])
+        expect(otherTitle.0 == 409 && code(otherTitle.1) == "idempotency_conflict", "create key reused for another task → idempotency_conflict")
+        expect(code(call("POST", "/v1/tasks", body: ["fields": ["title": "x"], "idempotency_key": "k1"]).1) == "idempotency_conflict",
+               "create key that belongs to a progress entry → idempotency_conflict")
+
+        let minimal = call("POST", "/v1/tasks", body: ["fields": ["title": "Quick check"]])
+        let mt = minimal.1["task"] as? [String: Any]
+        expect(minimal.0 == 201 && mt?["kind"] as? String == "experiment" && mt?["status"] as? String == "Planned"
+               && mt?["project_id"] is NSNull, "defaults: experiment, Planned, no project")
+        let inPersonal = call("POST", "/v1/tasks", body: ["fields": ["title": "Book physio", "project_id": personal.id]])
+        expect((inPersonal.1["task"] as? [String: Any])?["kind"] as? String == "personal", "kind follows a personal project's type")
+        let explicitKind = call("POST", "/v1/tasks", body: ["fields": ["title": "Fix loader", "kind": "coding", "project_id": project.id]])
+        expect((explicitKind.1["task"] as? [String: Any])?["kind"] as? String == "coding", "explicit kind wins")
+
+        let countBefore = store.items.count
+        expect(errorField(call("POST", "/v1/tasks", body: ["fields": ["setup": "x"]]).1) == "title", "create without title rejected")
+        expect(errorField(call("POST", "/v1/tasks", body: ["fields": ["title": "x", "kind": "experiments"]]).1) == "kind", "unknown kind rejected")
+        expect(errorField(call("POST", "/v1/tasks", body: ["fields": ["title": "x", "status": "failed"]]).1) == "status", "chat status rejected on create")
+        expect(errorField(call("POST", "/v1/tasks", body: ["fields": ["title": "x", "project_id": "nope"]]).1) == "project_id", "unknown project rejected on create")
+        expect(errorField(call("POST", "/v1/tasks", body: ["title": "x"]).1) == "title", "fields outside `fields` rejected on create")
+        expect(code(call("POST", "/v1/tasks", body: ["fields": ["title": "x"]], token: nil).1) == "unauthorized", "create needs the token")
+        expect(store.items.count == countBefore, "rejected creates add nothing")
+
         // Persistence
         let reopened = Store(url: url)
         let back = reopened.item(exp.id)
@@ -176,6 +226,9 @@ enum APIHarness {
         expect(await send("PATCH", "/tasks/\(taskID)", token: token, body: ["expected_revision": revision, "fields": ["notes": "x"]]).0 == 409,
                "HTTP: revision conflict → 409")
         expect(await send("DELETE", "/tasks/\(taskID)", token: token).0 == 405, "HTTP: unsupported method → 405")
+        let (s3, made) = await send("POST", "/tasks", token: token, body: ["fields": ["title": "Created over HTTP"], "idempotency_key": "http-1"])
+        let madeID = (made["task"] as? [String: Any])?["id"] as? String
+        expect(s3 == 201 && store.item(madeID)?.title == "Created over HTTP", "HTTP: create_task")
 
         server.regenerateToken()
         expect(await send("GET", "/tasks", token: token).0 == 401, "HTTP: old token stops working after regenerating")

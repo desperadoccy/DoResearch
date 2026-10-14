@@ -44,6 +44,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/tasks?chat_id=$CODEX_CHAT_ID"
 |---|---|
 | `list_projects` | `GET /v1/projects` |
 | `list_tasks` | `GET /v1/tasks` |
+| `create_task` | `POST /v1/tasks` |
 | `get_task` | `GET /v1/tasks/{id}` |
 | `update_task` | `PATCH /v1/tasks/{id}` |
 | `append_progress_log` | `POST /v1/tasks/{id}/progress` |
@@ -74,7 +75,9 @@ Names are matched case-insensitively on input and always returned as above. **Ch
 {
   "statuses": [{"name": "Inbox", "open": true}, …, {"name": "Dropped", "open": false}],
   "outcomes": ["pending", "supported", "refuted", "inconclusive", "failed"],
-  "updatable_fields": ["title", "status", …]
+  "updatable_fields": ["title", "status", …],
+  "creatable_fields": ["kind", "title", "status", …],
+  "kinds": ["coding", "experiment", …]
 }
 ```
 
@@ -174,6 +177,47 @@ Unknown parameters are rejected (`invalid_field`), so typos don't silently widen
 {"total": 1, "tasks": [ /* task summaries */ ]}
 ```
 
+### `POST /v1/tasks`
+
+```json
+{
+  "fields": {
+    "title": "Sweep lr 1e-4..1e-3",
+    "project_id": "b7x2n4kc",
+    "status": "Running",
+    "setup": "5 seeds, configs/sweep.yaml",
+    "chat_ids": ["codex-2"]
+  },
+  "source_chat_id": "codex-2",
+  "idempotency_key": "codex-2/create-sweep"
+}
+```
+
+`fields` takes `title` (required) and any of the fields `update_task` accepts, plus `kind`. Defaults:
+
+| Field | Default |
+|---|---|
+| `kind` | `experiment`, or the matching kind when `project_id` is a personal (`personal`) or misc (`misc`) project. An explicit `kind` always wins. |
+| `status` | `Planned`. Creating a task as `Running` stamps its run start time. |
+| `project_id` | `null` |
+| everything else | empty |
+
+`source_chat_id` and `idempotency_key` are optional. Including `idempotency_key` is strongly recommended, so a retried request can't create the task twice. `source_chat_id` is recorded on the task's "created" log entry. To link the chat to the task, also put its id in `chat_ids`.
+
+| Case | Response |
+|---|---|
+| New task | `201`, `"duplicate": false` |
+| Same key, title, kind, and `source_chat_id` as an earlier create | `200`, `"duplicate": true`, the task as it is now (even if it was edited since). Nothing new is created. |
+| Key already used for a different task or for a progress entry | `409 idempotency_conflict` |
+
+Idempotency keys share one namespace with progress entries, so don't reuse a progress entry's key.
+
+```json
+{"task": { /* task, revision 1, with its "created" log entry */ }, "duplicate": false}
+```
+
+The task is added at the top of the app's manual order and appears in the app immediately.
+
 ### `GET /v1/tasks/{id}`
 
 Query: `log_limit` (default 50, max 500).
@@ -258,16 +302,16 @@ Every error has this shape. `code` is stable; `message` is for people.
 | 404 | `not_found` | No such endpoint | |
 | 405 | `method_not_allowed` | Wrong HTTP method | `allowed_methods` |
 | 409 | `revision_conflict` | `expected_revision` is stale | `expected_revision`, `current_revision`, `task` |
-| 409 | `idempotency_conflict` | Key reused for a different entry | `existing_entry` |
+| 409 | `idempotency_conflict` | Key reused for a different entry or task | `existing_entry` |
 | 413 | `payload_too_large` | Body over 1 MiB | |
-| 422 | `invalid_field` | Unknown or read-only field, wrong type, unknown status/outcome/kind, empty title, unknown query parameter | `field`, and `allowed` when there is a fixed set |
+| 422 | `invalid_field` | Unknown or read-only field, wrong type, unknown status/outcome/kind/project, missing or empty title, unknown query parameter | `field`, and `allowed` when there is a fixed set |
 | 500 | `storage_error` | The database write failed; nothing was changed | |
 
 When the app is closed or the API is disabled, connections are refused.
 
 ## Typical flow for a chat
 
-1. `GET /v1/tasks?chat_id=<chat>`. If nothing matches, find the task with `?title=…` or `?project_id=…`, then link it: `PATCH` with `chat_ids` = current list + your chat id, and `expected_revision`.
+1. `GET /v1/tasks?chat_id=<chat>`. If nothing matches, find the task with `?title=…` or `?project_id=…`, then link it: `PATCH` with `chat_ids` = current list + your chat id, and `expected_revision`. If the task doesn't exist yet, `POST /v1/tasks` with your chat id in `chat_ids` and an idempotency key.
 2. When the experiment changes phase or setup, `PATCH` the fields with `expected_revision`. On `409`, re-read and retry.
 3. Log progress with `POST …/progress` and a deterministic idempotency key, so retries never duplicate entries.
 4. To verify, `GET /v1/tasks/{id}` and compare the fields and `revision`.

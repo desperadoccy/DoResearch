@@ -69,6 +69,8 @@ struct TaskAPI {
     static let outcomeNames = ExperimentOutcome.allCases.map(\.rawValue)
     static let updatableFields = ["title", "status", "project_id", "notes", "hypothesis", "setup", "compute", "results",
                                   "conclusion", "outcome", "metrics", "chat_ids"]
+    /// `kind` can be chosen only when creating a task.
+    static let creatableFields = ["kind"] + updatableFields
 
     func handle(_ request: APIRequest) -> APIResponse {
         do {
@@ -98,8 +100,8 @@ struct TaskAPI {
             try allow(r, "GET")
             return try listProjects(r)
         case 1 where rest[0] == "tasks":
-            try allow(r, "GET")
-            return try listTasks(r)
+            try allow(r, "GET", "POST")
+            return r.method == "GET" ? try listTasks(r) : try createTask(r)
         case 2 where rest[0] == "tasks":
             try allow(r, "GET", "PATCH")
             return r.method == "GET" ? try getTask(rest[1], r) : try updateTask(rest[1], r)
@@ -177,6 +179,8 @@ struct TaskAPI {
             "statuses": ItemStatus.allCases.map { ["name": Self.statusName($0), "open": $0.isOpen] },
             "outcomes": Self.outcomeNames,
             "updatable_fields": Self.updatableFields,
+            "creatable_fields": Self.creatableFields,
+            "kinds": ItemKind.allCases.map(\.rawValue),
         ])
     }
 
@@ -313,6 +317,63 @@ struct TaskAPI {
         default:
             throw APIError.invalidField(key, "\(key) is not an updatable field.", allowed: Self.updatableFields)
         }
+    }
+
+    private func createTask(_ r: APIRequest) throws -> APIResponse {
+        let body = try body(r)
+        let keys = ["fields", "source_chat_id", "idempotency_key"]
+        if let unknown = body.keys.sorted().first(where: { !keys.contains($0) }) {
+            throw APIError.invalidField(unknown, "Unknown key \(unknown). Put task fields under `fields`.", allowed: keys)
+        }
+        guard let fields = body["fields"] as? [String: Any] else {
+            throw APIError.invalidField("fields", "`fields` must be an object of task fields; `title` is required.",
+                                        allowed: Self.creatableFields)
+        }
+        func optionalString(_ key: String) throws -> String? {
+            guard let raw = body[key], !(raw is NSNull) else { return nil }
+            guard let s = raw as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw APIError.invalidField(key, "\(key) must be a non-empty string when given.")
+            }
+            return s
+        }
+        let sourceChatID = try optionalString("source_chat_id")
+        let key = try optionalString("idempotency_key")
+        guard fields["title"] != nil else { throw APIError.invalidField("title", "title is required.") }
+
+        var draft = Item(id: "", title: "", status: .todo)
+        for name in fields.keys.sorted() where name != "kind" {
+            try apply(name, fields[name]!, to: &draft)
+        }
+        // Without an explicit kind, a task gets the kind its project's type implies (experiment for research work).
+        if let raw = fields["kind"] {
+            guard let s = raw as? String, let kind = ItemKind(rawValue: s) else {
+                throw APIError.invalidField("kind", "Unknown kind.", allowed: ItemKind.allCases.map(\.rawValue))
+            }
+            draft.kind = kind
+        } else {
+            let type = store.project(draft.projectID)?.type ?? .research
+            draft.kind = type == .research ? .experiment : type.defaultKind
+        }
+
+        if let key, let existing = try store.logEntry(idempotencyKey: key) {
+            // The "created" entry records the kind and title the task was created with, so later edits don't matter.
+            let createdText = "Created \(draft.kind.label.lowercased()) “\(draft.title)”"
+            guard existing.kind == "created", let id = existing.itemID, store.item(id) != nil,
+                  existing.sourceChatID == sourceChatID, existing.text == createdText else {
+                throw APIError(status: 409, code: "idempotency_conflict",
+                               message: "idempotency_key was already used for a different request. Use a new key for a new task.",
+                               details: ["existing_entry": Self.logJSON(existing)])
+            }
+            return .json(200, ["task": try stored(id, logLimit: 50), "duplicate": true])
+        }
+
+        let created: Item
+        do {
+            created = try store.insertItem(draft, author: .api, sourceChatID: sourceChatID, idempotencyKey: key)
+        } catch {
+            throw APIError.storage(error)
+        }
+        return .json(201, ["task": try stored(created.id, logLimit: 50), "duplicate": false])
     }
 
     private func appendProgress(_ id: String, _ r: APIRequest) throws -> APIResponse {
