@@ -7,6 +7,7 @@ struct DoResearchApp: App {
     @State private var appState = AppState()
     @State private var agent: AgentSession
     @State private var providers: ProviderStore
+    @State private var apiServer: APIServer
 
     init() {
         // Lets the bare SwiftPM binary behave like a normal app (dock icon, focus) when run outside the bundle.
@@ -16,6 +17,7 @@ struct DoResearchApp: App {
         let providers = ProviderStore()
         _providers = State(initialValue: providers)
         _agent = State(initialValue: AgentSession(store: store, providers: providers))
+        _apiServer = State(initialValue: APIServer(store: store))
     }
 
     var body: some Scene {
@@ -62,6 +64,7 @@ struct DoResearchApp: App {
 
         Settings {
             SettingsView()
+                .environment(apiServer)
                 .environment(agent)
                 .environment(providers)
         }

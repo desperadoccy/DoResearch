@@ -102,47 +102,80 @@ final class Store {
     /// otherwise from `draft.checklist` (keeping their done state, as when duplicating).
     @discardableResult
     func createItem(_ draft: Item, checklist: [String] = [], author: Author = .user, logText: String? = nil) -> Item {
+        do {
+            return try insertItem(draft, checklist: checklist, author: author, logText: logText)
+        } catch {
+            report(error)
+            return draft
+        }
+    }
+
+    /// `createItem` for callers that need to know whether the write reached the database. The item and its
+    /// "created" log entry are saved together, so an `idempotencyKey` on that entry is never left without its item.
+    @discardableResult
+    func insertItem(_ draft: Item, checklist: [String] = [], author: Author = .user, logText: String? = nil,
+                    sourceChatID: String? = nil, idempotencyKey: String? = nil) throws -> Item {
         var item = draft
         if item.id.isEmpty || self.item(item.id) != nil { item.id = uniqueItemID() }
         let now = Date()
         item.createdAt = now
         item.updatedAt = now
+        item.revision = 1
         item.position = (items.map(\.position).min() ?? 0) - 1
         if !item.status.isOpen, item.completedAt == nil { item.completedAt = now }
         if item.status.isOpen { item.completedAt = nil }
         if item.kind == .experiment, item.status == .inProgress, item.runStartedAt == nil { item.runStartedAt = now }
         let steps = checklist.isEmpty ? draft.checklist.map { ($0.title, $0.done) } : checklist.map { ($0, false) }
         item.checklist = []
-        do {
-            try db.transaction {
-                try db.execute(
-                    "INSERT INTO items (\(Self.itemColumns.joined(separator: ","))) VALUES (\(Self.placeholders(Self.itemColumns.count)))",
-                    Self.itemParams(item)
-                )
-                for (i, step) in steps.enumerated() {
-                    let entry = ChecklistEntry(id: ShortID.make(10), itemID: item.id, title: step.0, done: step.1, position: i)
-                    try insertChecklist(entry)
-                    item.checklist.append(entry)
-                }
+        let text = logText ?? "Created \(item.kind.label.lowercased()) “\(item.title)”"
+        try db.transaction {
+            try db.execute(
+                "INSERT INTO items (\(Self.itemColumns.joined(separator: ","))) VALUES (\(Self.placeholders(Self.itemColumns.count)))",
+                Self.itemParams(item)
+            )
+            for (i, step) in steps.enumerated() {
+                let entry = ChecklistEntry(id: ShortID.make(10), itemID: item.id, title: step.0, done: step.1, position: i)
+                try insertChecklist(entry)
+                item.checklist.append(entry)
             }
-            items.append(item)
-            log(item: item.id, project: item.projectID, kind: "created",
-                text: logText ?? "Created \(item.kind.label.lowercased()) “\(item.title)”", author: author)
-        } catch {
-            report(error)
+            try db.execute(
+                "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
+                [ShortID.make(12), item.id, item.projectID, "created", text, author.rawValue, now, sourceChatID, idempotencyKey]
+            )
         }
+        items.append(item)
+        logRevision += 1
         return item
     }
 
-    /// Persists `updated`. Status transitions are timestamped and logged; agent edits are always logged.
+    /// The log entry stored under an idempotency key, if any.
+    func logEntry(idempotencyKey: String) throws -> LogEntry? {
+        try db.query("SELECT * FROM logs WHERE idempotency_key = ?", [idempotencyKey]).first.map(Self.log(from:))
+    }
+
+    /// Persists `updated`. Status transitions are timestamped and logged; agent and API edits are always logged.
     func updateItem(_ updated: Item, author: Author = .user) {
-        guard let index = items.firstIndex(where: { $0.id == updated.id }) else { return }
+        guard item(updated.id) != nil else { return } // e.g. a view saving an item that was just deleted
+        do {
+            try saveItem(updated, author: author)
+        } catch {
+            report(error)
+        }
+    }
+
+    /// `updateItem` for callers that need to know whether the write reached the database.
+    func saveItem(_ updated: Item, author: Author = .user) throws {
+        guard let index = items.firstIndex(where: { $0.id == updated.id }) else {
+            throw DatabaseError(message: "No item with id \(updated.id)")
+        }
         let old = items[index]
         var item = updated
         item.position = old.position // ordering changes only through reorder(), so stale copies can't undo a drag
+        item.revision = old.revision // stale copies carry an old revision; the store owns the count
         Self.normalizeProgress(&item)
         guard old != item else { return }
         item.updatedAt = Date()
+        item.revision = old.revision + 1
         if old.status == item.status { Self.followProgress(old, &item) }
 
         if old.kind != .experiment, item.kind == .experiment, item.status == .inProgress, item.runStartedAt == nil {
@@ -159,30 +192,34 @@ final class Store {
             }
         }
 
-        do {
-            let assignments = Self.itemColumns.dropFirst().map { "\($0) = ?" }.joined(separator: ", ")
-            var params = Array(Self.itemParams(item).dropFirst())
-            params.append(item.id)
-            try db.execute("UPDATE items SET \(assignments) WHERE id = ?", params)
-            items[index] = item
+        let assignments = Self.itemColumns.dropFirst().map { "\($0) = ?" }.joined(separator: ", ")
+        var params = Array(Self.itemParams(item).dropFirst())
+        params.append(item.id)
+        try db.execute("UPDATE items SET \(assignments) WHERE id = ?", params)
+        items[index] = item
 
-            if old.status != item.status {
-                log(item: item.id, project: item.projectID, kind: "status",
-                    text: "\(old.status.label(for: item.kind)) → \(item.status.label(for: item.kind))", author: author)
-            }
-            if old.progressCurrent != item.progressCurrent, item.tracksProgress {
-                logProgress(from: old, to: item, author: author)
-            }
-            if author == .agent {
-                let changed = Self.changedFields(old, item).filter { $0 != "status" }
-                if !changed.isEmpty {
-                    log(item: item.id, project: item.projectID, kind: "update",
-                        text: "Updated \(changed.joined(separator: ", "))", author: author)
-                }
-            }
-        } catch {
-            report(error)
+        if old.status != item.status {
+            log(item: item.id, project: item.projectID, kind: "status",
+                text: "\(old.status.label(for: item.kind)) → \(item.status.label(for: item.kind))", author: author)
         }
+        if old.progressCurrent != item.progressCurrent, item.tracksProgress {
+            logProgress(from: old, to: item, author: author)
+        }
+        if author != .user {
+            let changed = Self.changedFields(old, item).filter { $0 != "status" }
+            if !changed.isEmpty {
+                log(item: item.id, project: item.projectID, kind: "update",
+                    text: "Updated \(changed.joined(separator: ", "))", author: author)
+            }
+        }
+    }
+
+    /// Reads an item straight from the database, so API writes can be verified against what was actually stored.
+    func storedItem(_ id: String) throws -> Item? {
+        guard let row = try db.query("SELECT * FROM items WHERE id = ?", [id]).first else { return nil }
+        var item = Self.item(from: row)
+        item.checklist = try db.query("SELECT * FROM checklist WHERE item_id = ? ORDER BY position, rowid", [id]).map(Self.checklist(from:))
+        return item
     }
 
     /// Moves a tracked count by `delta` (never below zero; it may pass the target).
@@ -329,6 +366,7 @@ final class Store {
                 let live = item(source.id)
                 var draft = live ?? source
                 draft.id = ""
+                draft.chatIDs = [] // chats stay linked to the original, so lookups by chat id stay unambiguous
                 placement.apply(to: &draft)
                 fitKindToProject(&draft, explicitKind: placement.kind)
                 let created = createItem(draft, logText: live.map { "Copied from “\($0.title)”" })
@@ -354,6 +392,7 @@ final class Store {
             guard let original = item(id) else { continue }
             var draft = original
             draft.id = ""
+            draft.chatIDs = []
             let copy = createItem(draft, logText: "Duplicated from “\(original.title)”")
             let ordered = items.sorted(by: Self.manualOrder)
             let successor = ordered.firstIndex { $0.id == id }.flatMap { i in
@@ -419,7 +458,9 @@ final class Store {
 
     private func touch(_ index: Int) {
         items[index].updatedAt = Date()
-        try? db.execute("UPDATE items SET updated_at = ? WHERE id = ?", [items[index].updatedAt, items[index].id])
+        items[index].revision += 1
+        try? db.execute("UPDATE items SET updated_at = ?, revision = ? WHERE id = ?",
+                        [items[index].updatedAt, items[index].revision, items[index].id])
     }
 
     // MARK: Projects
@@ -467,9 +508,15 @@ final class Store {
 
     func deleteProject(_ id: String) {
         do {
-            try db.execute("DELETE FROM projects WHERE id = ?", [id])
+            try db.transaction {
+                try db.execute("UPDATE items SET revision = revision + 1 WHERE project_id = ?", [id])
+                try db.execute("DELETE FROM projects WHERE id = ?", [id])
+            }
             projects.removeAll { $0.id == id }
-            for i in items.indices where items[i].projectID == id { items[i].projectID = nil }
+            for i in items.indices where items[i].projectID == id {
+                items[i].projectID = nil
+                items[i].revision += 1
+            }
             logRevision += 1
         } catch {
             report(error)
@@ -500,6 +547,48 @@ final class Store {
         touch(index)
     }
 
+    /// Result of `appendProgress`: the stored entry, and whether it already existed under the same idempotency key.
+    struct AppendedLog {
+        var entry: LogEntry
+        var duplicate: Bool
+    }
+
+    struct IdempotencyConflict: Error {
+        let existing: LogEntry
+    }
+
+    /// Appends a progress note from an external chat. Replaying the same `idempotencyKey` returns the stored entry
+    /// instead of adding another; reusing a key for a different item or text throws `IdempotencyConflict`.
+    func appendProgress(_ text: String, itemID: String, sourceChatID: String, idempotencyKey: String,
+                        author: Author = .api) throws -> AppendedLog {
+        if let row = try db.query("SELECT * FROM logs WHERE idempotency_key = ?", [idempotencyKey]).first {
+            let existing = Self.log(from: row)
+            guard existing.itemID == itemID, existing.text == text, existing.sourceChatID == sourceChatID else {
+                throw IdempotencyConflict(existing: existing)
+            }
+            return AppendedLog(entry: existing, duplicate: true)
+        }
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else {
+            throw DatabaseError(message: "No item with id \(itemID)")
+        }
+        let entry = LogEntry(id: ShortID.make(12), itemID: itemID, projectID: items[index].projectID, kind: "note",
+                             text: text, author: author, createdAt: Date(), sourceChatID: sourceChatID,
+                             idempotencyKey: idempotencyKey)
+        let now = entry.createdAt
+        try db.transaction {
+            try db.execute(
+                "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
+                [entry.id, entry.itemID, entry.projectID, entry.kind, entry.text, entry.author.rawValue, entry.createdAt,
+                 entry.sourceChatID, entry.idempotencyKey]
+            )
+            try db.execute("UPDATE items SET updated_at = ?, revision = ? WHERE id = ?", [now, items[index].revision + 1, itemID])
+        }
+        items[index].updatedAt = now
+        items[index].revision += 1
+        logRevision += 1
+        return AppendedLog(entry: entry, duplicate: false)
+    }
+
     func logs(forItem id: String, limit: Int = 200) -> [LogEntry] {
         _ = logRevision
         return (try? db.query("SELECT * FROM logs WHERE item_id = ? ORDER BY created_at DESC LIMIT ?", [id, limit]))?
@@ -527,7 +616,7 @@ final class Store {
         "id", "title", "notes", "kind", "status", "priority", "project_id", "tags", "due_date", "flagged_today",
         "created_at", "updated_at", "completed_at", "repo", "branch", "link", "hypothesis", "setup", "compute",
         "results", "conclusion", "outcome", "metrics", "run_started_at", "run_ended_at", "position",
-        "progress_current", "progress_target", "progress_unit",
+        "progress_current", "progress_target", "progress_unit", "revision", "chat_ids",
     ]
 
     private static func placeholders(_ n: Int) -> String { Array(repeating: "?", count: n).joined(separator: ",") }
@@ -540,7 +629,7 @@ final class Store {
         [i.id, i.title, i.notes, i.kind.rawValue, i.status.rawValue, i.priority.rawValue, i.projectID, json(i.tags),
          i.dueDate, i.flaggedToday, i.createdAt, i.updatedAt, i.completedAt, i.repo, i.branch, i.link, i.hypothesis,
          i.setup, i.compute, i.results, i.conclusion, i.outcome.rawValue, json(i.metrics), i.runStartedAt, i.runEndedAt,
-         i.position, i.progressCurrent, i.progressTarget, i.progressUnit]
+         i.position, i.progressCurrent, i.progressTarget, i.progressUnit, i.revision, json(i.chatIDs)]
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, _ s: String?, default value: T) -> T {
@@ -576,6 +665,8 @@ final class Store {
             metrics: decode([Metric].self, r["metrics"]?.string, default: []),
             runStartedAt: r["run_started_at"]?.date,
             runEndedAt: r["run_ended_at"]?.date,
+            revision: r["revision"]?.int ?? 1,
+            chatIDs: decode([String].self, r["chat_ids"]?.string, default: []),
             progressCurrent: r["progress_current"]?.int ?? 0,
             progressTarget: r["progress_target"]?.int,
             progressUnit: r["progress_unit"]?.string ?? ""
@@ -598,7 +689,8 @@ final class Store {
     private static func log(from r: Row) -> LogEntry {
         LogEntry(id: r["id"]?.string ?? "", itemID: r["item_id"]?.string, projectID: r["project_id"]?.string,
                  kind: r["kind"]?.string ?? "note", text: r["text"]?.string ?? "",
-                 author: Author(rawValue: r["author"]?.string ?? "") ?? .user, createdAt: r["created_at"]?.date ?? Date())
+                 author: Author(rawValue: r["author"]?.string ?? "") ?? .user, createdAt: r["created_at"]?.date ?? Date(),
+                 sourceChatID: r["source_chat_id"]?.string, idempotencyKey: r["idempotency_key"]?.string)
     }
 
     private static func changedFields(_ a: Item, _ b: Item) -> [String] {
@@ -610,7 +702,7 @@ final class Store {
         check("hypothesis", \.hypothesis); check("setup", \.setup); check("compute", \.compute); check("results", \.results)
         check("conclusion", \.conclusion); check("outcome", \.outcome); check("metrics", \.metrics)
         check("run start", \.runStartedAt); check("run end", \.runEndedAt)
-        check("progress target", \.progressTarget); check("progress unit", \.progressUnit)
+        check("progress target", \.progressTarget); check("progress unit", \.progressUnit); check("linked chats", \.chatIDs)
         return out
     }
 }

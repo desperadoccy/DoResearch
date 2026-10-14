@@ -87,6 +87,10 @@ Add one from a preset with **+**, set its base URL, key, and model (the ↻ butt
 
 **Switching:** use the menu in the assistant panel's header (providers with several *Quick Switch Models* show them as a submenu), the **Assistant** menu, or **⌃⌘1–9**. Switching keeps the conversation: the transcript is stored in a provider-neutral form and translated for whichever API answers next.
 
+## Local API
+
+Local tools such as Codex chats can find, create, and update tasks and log progress through a JSON API served by the app on `127.0.0.1`. Turn it on in **Settings → API**. Requests need a bearer token, which is kept with the base URL in `api.json` next to the database (readable only by you). Changes go through the same store as the UI, so they appear at once and are logged with author *API*. Each task has a revision number for conflict checks, and creates and progress entries take an idempotency key so retries never duplicate them. Endpoints, schemas, statuses, and error codes are in [docs/API.md](docs/API.md).
+
 ## Shortcuts
 
 | | |
@@ -105,4 +109,4 @@ Add one from a preset with **+**, set its base URL, key, and model (the ↻ butt
 
 ## Data
 
-SQLite at `~/Library/Application Support/DoResearch/doresearch.sqlite` (WAL mode). Override with `DORESEARCH_DB=/path/to/file.sqlite` — useful for testing against scratch data.
+SQLite at `~/Library/Application Support/DoResearch/doresearch.sqlite` (WAL mode). Override with `DORESEARCH_DB=/path/to/file.sqlite` — useful for testing against scratch data. The API connection file (`api.json`) lives in the same folder.

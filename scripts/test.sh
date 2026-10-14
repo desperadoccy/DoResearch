@@ -1,10 +1,10 @@
 #!/bin/zsh
-# Compiles the data, agent, and provider layers with headless harnesses and runs them against a local mock server.
+# Compiles the data, agent, API, and provider layers with headless harnesses and runs them against a local mock server.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build
 swiftc -parse-as-library -swift-version 5 -target "$(uname -m)-apple-macos14.0" -lsqlite3 \
-  Sources/DoResearch/Data/*.swift Sources/DoResearch/Agent/*.swift Tests/*.swift \
+  Sources/DoResearch/Data/*.swift Sources/DoResearch/Agent/*.swift Sources/DoResearch/API/*.swift Tests/*.swift \
   -o build/tool-harness
 
 LOGDIR=$(mktemp -d)
