@@ -50,7 +50,7 @@ class H(BaseHTTPRequestHandler):
         tools = [t["function"]["name"] for t in body.get("tools", [])]
         last = msgs[-1]
         if last["role"] == "tool":
-            msg = {"role": "assistant", "content": f"<think>hidden</think>Saw tool result: {last['content'][:60]}"}
+            msg = {"role": "assistant", "content": f"<think>hidden</think>Saw tool result: {last['content'][:4000]}"}
             return self.send(200, {"model": body["model"], "choices": [{"message": msg, "finish_reason": "stop"}]})
         name = "ping" if "ping" in tools else "list_projects"
         args = {"message": "ok"} if name == "ping" else {}
@@ -67,7 +67,7 @@ class H(BaseHTTPRequestHandler):
         results = [b for b in content if b.get("type") == "tool_result"]
         if results:
             out = [{"type": "thinking", "thinking": "", "signature": "sig-final"},
-                   {"type": "text", "text": f"Claude saw: {str(results[0]['content'])[:60]}"}]
+                   {"type": "text", "text": f"Claude saw: {str(results[0]['content'])[:4000]}"}]
             return self.send(200, {"model": body["model"], "content": out, "stop_reason": "end_turn"})
         names = [t["name"] for t in body.get("tools", [])]
         name = "ping" if "ping" in names else "list_projects"

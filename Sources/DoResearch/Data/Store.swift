@@ -110,13 +110,13 @@ final class Store {
         }
     }
 
-    /// `createItem` for callers that need to know whether the write reached the database. The item and its
-    /// "created" log entry are saved together, so an `idempotencyKey` on that entry is never left without its item.
+    /// `createItem` for callers that need to know whether the write reached the database. The item, its checklist,
+    /// and its "created" log entry are saved together.
     @discardableResult
-    func insertItem(_ draft: Item, checklist: [String] = [], author: Author = .user, logText: String? = nil,
-                    sourceChatID: String? = nil, idempotencyKey: String? = nil) throws -> Item {
+    func insertItem(_ draft: Item, checklist: [String] = [], author: Author = .user, logText: String? = nil) throws -> Item {
         var item = draft
         if item.id.isEmpty || self.item(item.id) != nil { item.id = uniqueItemID() }
+        Self.normalizeProgress(&item)
         let now = Date()
         item.createdAt = now
         item.updatedAt = now
@@ -138,19 +138,10 @@ final class Store {
                 try insertChecklist(entry)
                 item.checklist.append(entry)
             }
-            try db.execute(
-                "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
-                [ShortID.make(12), item.id, item.projectID, "created", text, author.rawValue, now, sourceChatID, idempotencyKey]
-            )
+            try writeLog(item: item.id, project: item.projectID, kind: "created", text: text, author: author)
         }
         items.append(item)
-        logRevision += 1
         return item
-    }
-
-    /// The log entry stored under an idempotency key, if any.
-    func logEntry(idempotencyKey: String) throws -> LogEntry? {
-        try db.query("SELECT * FROM logs WHERE idempotency_key = ?", [idempotencyKey]).first.map(Self.log(from:))
     }
 
     /// Persists `updated`. Status transitions are timestamped and logged; agent and API edits are always logged.
@@ -195,23 +186,30 @@ final class Store {
         let assignments = Self.itemColumns.dropFirst().map { "\($0) = ?" }.joined(separator: ", ")
         var params = Array(Self.itemParams(item).dropFirst())
         params.append(item.id)
-        try db.execute("UPDATE items SET \(assignments) WHERE id = ?", params)
-        items[index] = item
-
-        if old.status != item.status {
-            log(item: item.id, project: item.projectID, kind: "status",
-                text: "\(old.status.label(for: item.kind)) → \(item.status.label(for: item.kind))", author: author)
-        }
-        if old.progressCurrent != item.progressCurrent, item.tracksProgress {
-            logProgress(from: old, to: item, author: author)
-        }
-        if author != .user {
-            let changed = Self.changedFields(old, item).filter { $0 != "status" }
-            if !changed.isEmpty {
-                log(item: item.id, project: item.projectID, kind: "update",
-                    text: "Updated \(changed.joined(separator: ", "))", author: author)
+        let recent = recentProgressLog
+        do {
+            try db.transaction {
+                try db.execute("UPDATE items SET \(assignments) WHERE id = ?", params)
+                if old.status != item.status {
+                    try writeLog(item: item.id, project: item.projectID, kind: "status",
+                                 text: "\(old.status.label(for: item.kind)) → \(item.status.label(for: item.kind))", author: author)
+                }
+                if old.progressCurrent != item.progressCurrent, item.tracksProgress {
+                    try logProgress(from: old, to: item, author: author)
+                }
+                if author != .user {
+                    let changed = Self.changedFields(old, item).filter { $0 != "status" }
+                    if !changed.isEmpty {
+                        try writeLog(item: item.id, project: item.projectID, kind: "update",
+                                     text: "Updated \(changed.joined(separator: ", "))", author: author)
+                    }
+                }
             }
+        } catch {
+            recentProgressLog = recent
+            throw error
         }
+        items[index] = item
     }
 
     /// Reads an item straight from the database, so API writes can be verified against what was actually stored.
@@ -235,6 +233,13 @@ final class Store {
         item.progressUnit = item.progressUnit.trimmingCharacters(in: .whitespaces)
     }
 
+    /// The status a new item takes from its count when no status was chosen for it: the same rules as for a count set
+    /// on an existing item (any progress starts it, reaching the target finishes it).
+    static func applyInitialProgress(_ item: inout Item) {
+        normalizeProgress(&item)
+        followProgress(Item(id: item.id, title: item.title, status: item.status), &item)
+    }
+
     /// When only the count or target moved, status follows: the first step starts the item, reaching the target
     /// finishes it, and falling back below the target reopens it. An explicit status change in the same edit wins.
     private static func followProgress(_ old: Item, _ item: inout Item) {
@@ -250,23 +255,23 @@ final class Store {
         }
     }
 
-    /// Count changes by the same author within five minutes share one log entry ("Progress 3 → 7/10 papers")
-    /// instead of logging every click.
-    @ObservationIgnored private var recentProgressLog: [String: (logID: String, from: Int, author: Author, at: Date)] = [:]
+    /// Count changes by the same author (and, for API callers, the same chat) within five minutes share one log entry
+    /// ("Progress 3 → 7/10 papers") instead of logging every click.
+    @ObservationIgnored private var recentProgressLog: [String: (logID: String, from: Int, author: Author, chatID: String?, at: Date)] = [:]
 
-    private func logProgress(from old: Item, to item: Item, author: Author) {
+    private func logProgress(from old: Item, to item: Item, author: Author) throws {
         let now = Date()
         var start = old.progressCurrent
-        if let recent = recentProgressLog.removeValue(forKey: item.id), recent.author == author, now.timeIntervalSince(recent.at) < 300 {
+        if let recent = recentProgressLog.removeValue(forKey: item.id), recent.author == author,
+           recent.chatID == audit.sourceChatID, now.timeIntervalSince(recent.at) < 300 {
             start = recent.from
-            try? db.execute("DELETE FROM logs WHERE id = ?", [recent.logID])
+            try db.execute("DELETE FROM logs WHERE id = ?", [recent.logID])
             logRevision += 1
         }
         guard start != item.progressCurrent else { return }
-        if let id = log(item: item.id, project: item.projectID, kind: "progress",
-                        text: "Progress \(start) → \(item.progressLabel)", author: author) {
-            recentProgressLog[item.id] = (id, start, author, now)
-        }
+        let entry = try writeLog(item: item.id, project: item.projectID, kind: "progress",
+                                 text: "Progress \(start) → \(item.progressLabel)", author: author)
+        recentProgressLog[item.id] = (entry.id, start, author, audit.sourceChatID, now)
     }
 
     func setStatus(_ status: ItemStatus, for id: String, author: Author = .user) {
@@ -456,6 +461,71 @@ final class Store {
         }
     }
 
+    /// Checklist changes with every step already resolved to an id of the item's checklist.
+    struct ChecklistChanges {
+        var add: [String] = []
+        var check: [String] = []
+        var uncheck: [String] = []
+        var remove: [String] = []
+    }
+
+    /// Applies a batch of checklist changes in one transaction: removals, then checks and unchecks, then additions
+    /// appended in order. The item's revision moves once, and only if something changed. Returns the added entries.
+    @discardableResult
+    func applyChecklist(_ itemID: String, _ changes: ChecklistChanges, author: Author) throws -> [ChecklistEntry] {
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else {
+            throw DatabaseError(message: "No item with id \(itemID)")
+        }
+        var list = items[index].checklist
+        var added: [ChecklistEntry] = []
+        var checked: [String] = []
+        var other: [String] = []
+        let now = Date()
+        try db.transaction {
+            for id in changes.remove {
+                guard let i = list.firstIndex(where: { $0.id == id }) else { throw DatabaseError(message: "No checklist step \(id)") }
+                try db.execute("DELETE FROM checklist WHERE id = ?", [id])
+                other.append("removed “\(list[i].title)”")
+                list.remove(at: i)
+            }
+            for (ids, done) in [(changes.check, true), (changes.uncheck, false)] {
+                for id in ids {
+                    guard let i = list.firstIndex(where: { $0.id == id }) else { throw DatabaseError(message: "No checklist step \(id)") }
+                    guard list[i].done != done else { continue }
+                    try db.execute("UPDATE checklist SET done = ? WHERE id = ?", [done, id])
+                    list[i].done = done
+                    if done { checked.append(list[i].title) } else { other.append("unchecked “\(list[i].title)”") }
+                }
+            }
+            var position = (list.map(\.position).max() ?? -1) + 1
+            for title in changes.add {
+                let entry = ChecklistEntry(id: ShortID.make(10), itemID: itemID, title: title, done: false, position: position)
+                position += 1
+                try insertChecklist(entry)
+                list.append(entry)
+                added.append(entry)
+                other.append("added “\(title)”")
+            }
+            guard !checked.isEmpty || !other.isEmpty else { return }
+            try db.execute("UPDATE items SET updated_at = ?, revision = ? WHERE id = ?", [now, items[index].revision + 1, itemID])
+            let done = list.filter(\.done).count
+            for title in checked {
+                try writeLog(item: itemID, project: items[index].projectID, kind: "update",
+                             text: "Checked “\(title)” (\(done)/\(list.count))", author: author)
+            }
+            if author != .user, !other.isEmpty {
+                try writeLog(item: itemID, project: items[index].projectID, kind: "update",
+                             text: "Checklist: \(other.joined(separator: ", "))", author: author)
+            }
+        }
+        if !checked.isEmpty || !other.isEmpty {
+            items[index].checklist = list
+            items[index].updatedAt = now
+            items[index].revision += 1
+        }
+        return added
+    }
+
     private func touch(_ index: Int) {
         items[index].updatedAt = Date()
         items[index].revision += 1
@@ -475,28 +545,23 @@ final class Store {
         }
     }
 
-    /// `createProject` for callers that need to know whether the write reached the database. Like `insertItem`, the
-    /// project and its "created" log entry (which carries any `idempotencyKey`) are saved together.
+    /// `createProject` for callers that need to know whether the write reached the database. The project and its
+    /// "created" log entry are saved together.
     @discardableResult
-    func insertProject(_ draft: Project, author: Author = .user, sourceChatID: String? = nil,
-                       idempotencyKey: String? = nil) throws -> Project {
+    func insertProject(_ draft: Project, author: Author = .user) throws -> Project {
         var p = draft
         if p.id.isEmpty || project(p.id) != nil { p.id = ShortID.make() }
         p.createdAt = Date()
         p.updatedAt = p.createdAt
+        p.revision = 1
         try db.transaction {
             try db.execute(
-                "INSERT INTO projects (id, name, type, summary, color, symbol, status, deadline, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                [p.id, p.name, p.type.rawValue, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.createdAt, p.updatedAt]
+                "INSERT INTO projects (id, name, type, summary, color, symbol, status, deadline, created_at, updated_at, revision) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [p.id, p.name, p.type.rawValue, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.createdAt, p.updatedAt, p.revision]
             )
-            try db.execute(
-                "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
-                [ShortID.make(12), nil as String?, p.id, "created", "Created \(p.type.label.lowercased()) project “\(p.name)”",
-                 author.rawValue, p.createdAt, sourceChatID, idempotencyKey]
-            )
+            try writeLog(item: nil, project: p.id, kind: "created", text: "Created \(p.type.label.lowercased()) project “\(p.name)”", author: author)
         }
         projects.append(p)
-        logRevision += 1
         return p
     }
 
@@ -506,25 +571,48 @@ final class Store {
     }
 
     func updateProject(_ updated: Project, author: Author = .user) {
-        guard let index = projects.firstIndex(where: { $0.id == updated.id }), projects[index] != updated else { return }
-        let old = projects[index]
-        var p = updated
-        p.updatedAt = Date()
+        guard project(updated.id) != nil else { return }
         do {
-            try db.execute(
-                "UPDATE projects SET name = ?, type = ?, summary = ?, color = ?, symbol = ?, status = ?, deadline = ?, updated_at = ? WHERE id = ?",
-                [p.name, p.type.rawValue, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.updatedAt, p.id]
-            )
-            projects[index] = p
-            if old.status != p.status {
-                log(item: nil, project: p.id, kind: "status", text: "Project \(old.status.label) → \(p.status.label)", author: author)
-            }
-            if old.type != p.type {
-                log(item: nil, project: p.id, kind: "update", text: "Project type \(old.type.label) → \(p.type.label)", author: author)
-            }
+            try saveProject(updated, author: author)
         } catch {
             report(error)
         }
+    }
+
+    /// `updateProject` for callers that need to know whether the write reached the database. Like items, projects
+    /// get a new revision on every saved change, and agent and API edits are always logged.
+    func saveProject(_ updated: Project, author: Author = .user) throws {
+        guard let index = projects.firstIndex(where: { $0.id == updated.id }) else {
+            throw DatabaseError(message: "No project with id \(updated.id)")
+        }
+        let old = projects[index]
+        var p = updated
+        p.revision = old.revision
+        guard old != p else { return }
+        p.updatedAt = Date()
+        p.revision = old.revision + 1
+        try db.transaction {
+            try db.execute(
+                "UPDATE projects SET name = ?, type = ?, summary = ?, color = ?, symbol = ?, status = ?, deadline = ?, updated_at = ?, revision = ? WHERE id = ?",
+                [p.name, p.type.rawValue, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.updatedAt, p.revision, p.id]
+            )
+            if old.status != p.status {
+                try writeLog(item: nil, project: p.id, kind: "status", text: "Project \(old.status.label) → \(p.status.label)", author: author)
+            }
+            if old.type != p.type {
+                try writeLog(item: nil, project: p.id, kind: "update", text: "Project type \(old.type.label) → \(p.type.label)", author: author)
+            }
+            var changed: [String] = []
+            if old.name != p.name { changed.append("name") }
+            if old.summary != p.summary { changed.append("summary") }
+            if old.deadline != p.deadline { changed.append("deadline") }
+            if old.color != p.color { changed.append("color") }
+            if old.symbol != p.symbol { changed.append("icon") }
+            if author != .user, !changed.isEmpty {
+                try writeLog(item: nil, project: p.id, kind: "update", text: "Updated project \(changed.joined(separator: ", "))", author: author)
+            }
+        }
+        projects[index] = p
     }
 
     func deleteProject(_ id: String) {
@@ -548,71 +636,115 @@ final class Store {
 
     @discardableResult
     func log(item: String?, project: String?, kind: String, text: String, author: Author) -> String? {
-        let id = ShortID.make(12)
         do {
-            try db.execute(
-                "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at) VALUES (?,?,?,?,?,?,?)",
-                [id, item, project, kind, text, author.rawValue, Date()]
-            )
-            logRevision += 1
-            return id
+            return try writeLog(item: item, project: project, kind: kind, text: text, author: author).id
         } catch {
             report(error)
             return nil
         }
     }
 
+    /// Writes one log entry, stamped with the provenance of the enclosing `atomically` group: its source chat on
+    /// every entry, and its idempotency key on the first one.
+    @discardableResult
+    func writeLog(item: String?, project: String?, kind: String, text: String, author: Author) throws -> LogEntry {
+        let key = auditKeyUsed ? nil : audit.idempotencyKey
+        let entry = LogEntry(id: ShortID.make(12), itemID: item, projectID: project, kind: kind, text: text, author: author,
+                             createdAt: Date(), sourceChatID: audit.sourceChatID, idempotencyKey: key)
+        try db.execute(
+            "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
+            [entry.id, entry.itemID, entry.projectID, entry.kind, entry.text, entry.author.rawValue, entry.createdAt,
+             entry.sourceChatID, entry.idempotencyKey]
+        )
+        if key != nil { auditKeyUsed = true }
+        logRevision += 1
+        return entry
+    }
+
     func addNote(_ text: String, itemID: String, author: Author = .user) {
-        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
-        log(item: itemID, project: items[index].projectID, kind: "note", text: text, author: author)
-        touch(index)
-    }
-
-    /// Result of `appendProgress`: the stored entry, and whether it already existed under the same idempotency key.
-    struct AppendedLog {
-        var entry: LogEntry
-        var duplicate: Bool
-    }
-
-    struct IdempotencyConflict: Error {
-        let existing: LogEntry
-    }
-
-    /// Appends a progress note from an external chat. Replaying the same `idempotencyKey` returns the stored entry
-    /// instead of adding another; reusing a key for a different item or text throws `IdempotencyConflict`.
-    func appendProgress(_ text: String, itemID: String, sourceChatID: String, idempotencyKey: String,
-                        author: Author = .api) throws -> AppendedLog {
-        if let row = try db.query("SELECT * FROM logs WHERE idempotency_key = ?", [idempotencyKey]).first {
-            let existing = Self.log(from: row)
-            guard existing.itemID == itemID, existing.text == text, existing.sourceChatID == sourceChatID else {
-                throw IdempotencyConflict(existing: existing)
-            }
-            return AppendedLog(entry: existing, duplicate: true)
+        do {
+            try appendNote(text, itemID: itemID, author: author)
+        } catch {
+            report(error)
         }
+    }
+
+    /// Adds a note to an item's progress log and moves its revision, in one transaction. Never touches its fields.
+    @discardableResult
+    func appendNote(_ text: String, itemID: String, author: Author = .user) throws -> LogEntry {
         guard let index = items.firstIndex(where: { $0.id == itemID }) else {
             throw DatabaseError(message: "No item with id \(itemID)")
         }
-        let entry = LogEntry(id: ShortID.make(12), itemID: itemID, projectID: items[index].projectID, kind: "note",
-                             text: text, author: author, createdAt: Date(), sourceChatID: sourceChatID,
-                             idempotencyKey: idempotencyKey)
-        let now = entry.createdAt
+        let now = Date()
+        var entry: LogEntry?
         try db.transaction {
-            try db.execute(
-                "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
-                [entry.id, entry.itemID, entry.projectID, entry.kind, entry.text, entry.author.rawValue, entry.createdAt,
-                 entry.sourceChatID, entry.idempotencyKey]
-            )
+            entry = try writeLog(item: itemID, project: items[index].projectID, kind: "note", text: text, author: author)
             try db.execute("UPDATE items SET updated_at = ?, revision = ? WHERE id = ?", [now, items[index].revision + 1, itemID])
         }
         items[index].updatedAt = now
         items[index].revision += 1
-        logRevision += 1
-        return AppendedLog(entry: entry, duplicate: false)
+        return entry!
+    }
+
+    // MARK: Atomic groups and idempotency
+
+    private struct Audit {
+        var sourceChatID: String?
+        var idempotencyKey: String?
+    }
+
+    @ObservationIgnored private var audit = Audit()
+    @ObservationIgnored private var auditKeyUsed = false
+
+    /// Runs `body` as one transaction. If it throws, both the database and the in-memory copy are left as they were,
+    /// so callers can keep validating while they write. Log entries written inside carry `sourceChatID`, and the first
+    /// one records `idempotencyKey`. Nested calls join the outer group and keep its provenance.
+    func atomically<T>(sourceChatID: String? = nil, idempotencyKey: String? = nil, _ body: () throws -> T) throws -> T {
+        let saved = (items: items, projects: projects, recent: recentProgressLog, audit: audit, keyUsed: auditKeyUsed)
+        if !db.inTransaction {
+            audit = Audit(sourceChatID: sourceChatID, idempotencyKey: idempotencyKey)
+            auditKeyUsed = false
+        }
+        defer {
+            audit = saved.audit
+            auditKeyUsed = saved.keyUsed
+        }
+        var result: T?
+        do {
+            try db.transaction { result = try body() }
+        } catch {
+            items = saved.items
+            projects = saved.projects
+            recentProgressLog = saved.recent
+            logRevision += 1
+            throw error
+        }
+        return result!
+    }
+
+    /// A committed mutation recorded under an idempotency key.
+    struct IdempotencyRecord {
+        var operation: String
+        var fingerprint: String
+        var result: String
+    }
+
+    func idempotencyRecord(_ key: String) throws -> IdempotencyRecord? {
+        try db.query("SELECT * FROM idempotency WHERE key = ?", [key]).first.map {
+            IdempotencyRecord(operation: $0["operation"]?.string ?? "", fingerprint: $0["fingerprint"]?.string ?? "",
+                              result: $0["result"]?.string ?? "{}")
+        }
+    }
+
+    /// Call inside the `atomically` group of the mutation, so the record commits or rolls back with it.
+    func recordIdempotency(_ key: String, _ record: IdempotencyRecord) throws {
+        try db.execute("INSERT INTO idempotency (key, operation, fingerprint, result, created_at) VALUES (?,?,?,?,?)",
+                       [key, record.operation, record.fingerprint, record.result, Date()])
     }
 
     func logs(forItem id: String, limit: Int = 200) -> [LogEntry] {
         _ = logRevision
-        return (try? db.query("SELECT * FROM logs WHERE item_id = ? ORDER BY created_at DESC LIMIT ?", [id, limit]))?
+        return (try? db.query("SELECT * FROM logs WHERE item_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?", [id, limit]))?
             .map(Self.log(from:)) ?? []
     }
 
@@ -623,10 +755,10 @@ final class Store {
             rows = try? db.query("""
                 SELECT l.* FROM logs l LEFT JOIN items i ON i.id = l.item_id
                 WHERE l.created_at >= ? AND (l.project_id = ? OR i.project_id = ?)
-                ORDER BY l.created_at DESC LIMIT ?
+                ORDER BY l.created_at DESC, l.rowid DESC LIMIT ?
                 """, [date, projectID, projectID, limit])
         } else {
-            rows = try? db.query("SELECT * FROM logs WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?", [date, limit])
+            rows = try? db.query("SELECT * FROM logs WHERE created_at >= ? ORDER BY created_at DESC, rowid DESC LIMIT ?", [date, limit])
         }
         return rows?.map(Self.log(from:)) ?? []
     }
@@ -704,7 +836,8 @@ final class Store {
                 type: ProjectType(rawValue: r["type"]?.string ?? "") ?? .research, summary: r["summary"]?.string ?? "",
                 color: r["color"]?.string ?? "blue", symbol: r["symbol"]?.string ?? "folder",
                 status: ProjectStatus(rawValue: r["status"]?.string ?? "") ?? .active, deadline: r["deadline"]?.date,
-                createdAt: r["created_at"]?.date ?? Date(), updatedAt: r["updated_at"]?.date ?? Date())
+                createdAt: r["created_at"]?.date ?? Date(), updatedAt: r["updated_at"]?.date ?? Date(),
+                revision: r["revision"]?.int ?? 1)
     }
 
     private static func log(from r: Row) -> LogEntry {

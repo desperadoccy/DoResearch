@@ -403,6 +403,8 @@ struct Project: Identifiable, Hashable {
     var deadline: Date?
     var createdAt = Date()
     var updatedAt = Date()
+    /// Bumped on every saved change, like `Item.revision`.
+    var revision = 1
 
     static let palette: [String] = ["blue", "purple", "pink", "red", "orange", "yellow", "green", "teal", "indigo", "gray"]
     /// Every icon any project type offers (the assistant may pick any of them).
@@ -417,7 +419,7 @@ struct Project: Identifiable, Hashable {
     }
 
     init(id: String, name: String, type: ProjectType, summary: String, color: String, symbol: String,
-         status: ProjectStatus, deadline: Date?, createdAt: Date, updatedAt: Date) {
+         status: ProjectStatus, deadline: Date?, createdAt: Date, updatedAt: Date, revision: Int = 1) {
         self.id = id
         self.name = name
         self.type = type
@@ -428,6 +430,7 @@ struct Project: Identifiable, Hashable {
         self.deadline = deadline
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.revision = revision
     }
 
     var swiftColor: Color { Color.named(color) }
