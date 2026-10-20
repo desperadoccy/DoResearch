@@ -126,13 +126,27 @@ final class Database {
         return rows
     }
 
+    private var transactionDepth = 0
+    var inTransaction: Bool { transactionDepth > 0 }
+
+    /// Runs `body` atomically. Nested calls become savepoints, so a caller can group several writes that each use
+    /// a transaction of their own, and a failure anywhere rolls back the whole group.
     func transaction(_ body: () throws -> Void) throws {
-        try execute("BEGIN")
+        let depth = transactionDepth
+        let savepoint = "sp\(depth)"
+        try execute(depth == 0 ? "BEGIN" : "SAVEPOINT \(savepoint)")
+        transactionDepth += 1
+        defer { transactionDepth = depth }
         do {
             try body()
-            try execute("COMMIT")
+            try execute(depth == 0 ? "COMMIT" : "RELEASE \(savepoint)")
         } catch {
-            try? execute("ROLLBACK")
+            if depth == 0 {
+                try? execute("ROLLBACK")
+            } else {
+                try? execute("ROLLBACK TO \(savepoint)")
+                try? execute("RELEASE \(savepoint)")
+            }
             throw error
         }
     }
@@ -255,6 +269,32 @@ final class Database {
                 }
                 try execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_logs_idempotency ON logs(idempotency_key)")
                 try execute("PRAGMA user_version = 5")
+            }
+        }
+        if version < 6 {
+            try transaction {
+                let columns = try query("PRAGMA table_info(projects)").compactMap { $0["name"]?.string }
+                if !columns.contains("revision") {
+                    try execute("ALTER TABLE projects ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+                }
+                // One row per committed mutation that carried an idempotency key: replays return `result` instead of
+                // running again. Written in the same transaction as the mutation itself.
+                try execute("""
+                CREATE TABLE IF NOT EXISTS idempotency (
+                    key TEXT PRIMARY KEY,
+                    operation TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """)
+                // Keys used before v6 were recorded only on log entries. Keep them reserved so they can't be reused;
+                // their requests can't be matched as replays, so reusing one returns idempotency_conflict.
+                try execute("""
+                INSERT OR IGNORE INTO idempotency (key, operation, fingerprint, result, created_at)
+                SELECT idempotency_key, 'legacy', 'legacy:' || id, '{}', created_at FROM logs WHERE idempotency_key IS NOT NULL
+                """)
+                try execute("PRAGMA user_version = 6")
             }
         }
     }

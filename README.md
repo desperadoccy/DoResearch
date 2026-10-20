@@ -89,7 +89,11 @@ Add one from a preset with **+**, set its base URL, key, and model (the ↻ butt
 
 ## Local API
 
-Local tools such as Codex chats can find, create, and update tasks, create projects, and log progress through a JSON API served by the app on `127.0.0.1`. Turn it on in **Settings → API**. Requests need a bearer token, which is kept with the base URL in `api.json` next to the database (readable only by you). Changes go through the same store as the UI, so they appear at once and are logged with author *API*. Each task has a revision number for conflict checks, and creates and progress entries take an idempotency key so retries never duplicate them. Endpoints, schemas, statuses, and error codes are in [docs/API.md](docs/API.md).
+Local AI clients such as Codex chats can do everything the built-in assistant can, through a JSON API the app serves on `127.0.0.1`. Turn it on in **Settings → API**. Requests need a bearer token, which is kept with the base URL in `api.json` next to the database (readable only by you).
+
+The assistant and the API run the same operations from one shared registry, with the same arguments, validation, and results. `GET /v1/tools` lists them and their schemas, and `POST /v1/tools/{name}` calls one. Items come with their checklists and quantitative progress as structured data.
+
+Changes go through the same store as the UI, so they appear at once. They are saved together with their log entries, marked *Assistant* or *API*. Items and projects have revision numbers for conflict checks, and every change accepts an idempotency key so retries never repeat it. The original task and project endpoints still work as adapters over the same operations. Endpoints, schemas, statuses, and error codes are in [docs/API.md](docs/API.md).
 
 ## Shortcuts
 

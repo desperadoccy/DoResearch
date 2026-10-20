@@ -15,46 +15,22 @@ struct APIResponse {
     var body: Data
 
     static func json(_ status: Int, _ object: Any) -> APIResponse {
-        let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data("{}".utf8)
-        return APIResponse(status: status, body: data)
+        APIResponse(status: status, body: Wire.data(object))
     }
 }
 
-/// An error with a stable `code` clients can branch on. Serialized as `{"error": {"code", "message", ...details}}`.
-struct APIError: Error {
-    let status: Int
-    let code: String
-    let message: String
-    var details: [String: Any] = [:]
-
-    static func unauthorized() -> APIError {
-        APIError(status: 401, code: "unauthorized", message: "Missing or invalid bearer token. Send `Authorization: Bearer <token>`.")
-    }
-    static func taskNotFound(_ id: String) -> APIError {
-        APIError(status: 404, code: "task_not_found", message: "No task with id \(id).", details: ["task_id": id])
-    }
-    static func invalidField(_ field: String, _ message: String, allowed: [String]? = nil) -> APIError {
-        var details: [String: Any] = ["field": field]
-        if let allowed { details["allowed"] = allowed }
-        return APIError(status: 422, code: "invalid_field", message: message, details: details)
-    }
-    static func badRequest(_ message: String) -> APIError {
-        APIError(status: 400, code: "bad_request", message: message)
-    }
-    static func storage(_ error: Error) -> APIError {
-        APIError(status: 500, code: "storage_error", message: "The change could not be saved: \(error.localizedDescription)")
+extension OperationError {
+    static func unauthorized() -> OperationError {
+        OperationError(code: "unauthorized", message: "Missing or invalid bearer token. Send `Authorization: Bearer <token>`.")
     }
 
-    var response: APIResponse {
-        var body = details
-        body["code"] = code
-        body["message"] = message
-        return .json(status, ["error": body])
-    }
+    var response: APIResponse { .json(httpStatus, json) }
 }
 
-/// The local task API (docs/API.md). Runs on the main actor and changes data only through `Store`, like the UI and
-/// the assistant, so edits show up in the app at once and a revision check and its write can't interleave with UI edits.
+/// The local HTTP API (docs/API.md). `/v1/tools` exposes the shared operations of `OperationRegistry`, exactly as the
+/// built-in assistant calls them. The task and project endpoints from API v1 are kept as adapters that translate
+/// their requests into the same operations and answer in their original shapes. Runs on the main actor, so a
+/// revision check and its write can't interleave with UI edits.
 @MainActor
 struct TaskAPI {
     let store: Store
@@ -63,23 +39,15 @@ struct TaskAPI {
     static let version = 1
     static let maxLogLimit = 500
 
-    /// Experiment status names; the API uses them for every kind of item.
-    static func statusName(_ s: ItemStatus) -> String { s.label(for: .experiment) }
-    static let statusNames = ItemStatus.allCases.map(statusName)
-    static let outcomeNames = ExperimentOutcome.allCases.map(\.rawValue)
-    static let updatableFields = ["title", "status", "project_id", "notes", "hypothesis", "setup", "compute", "results",
-                                  "conclusion", "outcome", "metrics", "chat_ids"]
-    /// `kind` can be chosen only when creating a task.
-    static let creatableFields = ["kind"] + updatableFields
-    static let projectFields = ["name", "type", "summary", "status", "deadline", "color", "symbol"]
+    private var service: OperationService { OperationService(store: store) }
 
     func handle(_ request: APIRequest) -> APIResponse {
         do {
             return try route(request)
-        } catch let error as APIError {
+        } catch let error as OperationError {
             return error.response
         } catch {
-            return APIError.storage(error).response
+            return OperationError.storage(error).response
         }
     }
 
@@ -94,6 +62,12 @@ struct TaskAPI {
         }
         try authenticate(r)
         switch rest.count {
+        case 1 where rest[0] == "tools":
+            try allow(r, "GET")
+            return .json(200, discovery())
+        case 2 where rest[0] == "tools":
+            try allow(r, "POST")
+            return try invoke(rest[1], r)
         case 1 where rest[0] == "statuses":
             try allow(r, "GET")
             return statuses()
@@ -114,12 +88,12 @@ struct TaskAPI {
         }
     }
 
-    // MARK: Auth and routing helpers
+    // MARK: Auth and request helpers
 
     private func authenticate(_ r: APIRequest) throws {
         guard let header = r.headers["authorization"], header.hasPrefix("Bearer "), !token.isEmpty,
               Self.constantTimeEqual(String(header.dropFirst("Bearer ".count)), token) else {
-            throw APIError.unauthorized()
+            throw OperationError.unauthorized()
         }
     }
 
@@ -131,435 +105,263 @@ struct TaskAPI {
 
     private func allow(_ r: APIRequest, _ methods: String...) throws {
         guard methods.contains(r.method) else {
-            throw APIError(status: 405, code: "method_not_allowed", message: "\(r.method) is not supported here.",
-                           details: ["allowed_methods": methods])
+            throw OperationError(code: "method_not_allowed", message: "\(r.method) is not supported here.", details: ["allowed_methods": methods])
         }
     }
 
-    private func notFound(_ path: String) -> APIError {
-        APIError(status: 404, code: "not_found", message: "No endpoint at \(path). See docs/API.md.")
+    private func notFound(_ path: String) -> OperationError {
+        OperationError(code: "not_found", message: "No endpoint at \(path). See GET /v1/tools and docs/API.md.")
     }
 
     private func checkQuery(_ r: APIRequest, allowed: Set<String>) throws {
         if let unknown = r.query.keys.sorted().first(where: { !allowed.contains($0) }) {
-            throw APIError.invalidField(unknown, "Unknown query parameter \(unknown).", allowed: allowed.sorted())
+            throw OperationError.invalidField(unknown, "Unknown query parameter \(unknown).", allowed: allowed.sorted())
         }
     }
 
-    private func body(_ r: APIRequest) throws -> [String: Any] {
-        guard !r.body.isEmpty else { throw APIError.badRequest("A JSON object body is required.") }
+    private func body(_ r: APIRequest, allowEmpty: Bool = false) throws -> [String: Any] {
+        if r.body.isEmpty {
+            if allowEmpty { return [:] }
+            throw OperationError.badRequest("A JSON object body is required.")
+        }
         guard let object = try? JSONSerialization.jsonObject(with: r.body), let dict = object as? [String: Any] else {
-            throw APIError.badRequest("The body is not a JSON object.")
+            throw OperationError.badRequest("The body is not a JSON object.")
         }
         return dict
     }
 
-    private func limit(_ r: APIRequest, _ key: String, default value: Int, max: Int) throws -> Int {
-        guard let raw = r.query[key] else { return value }
-        guard let n = Int(raw), n >= 1 else { throw APIError.invalidField(key, "\(key) must be a positive integer.") }
-        return min(n, max)
+    private func checkKeys(_ body: [String: Any], _ allowed: [String], hint: String = "") throws {
+        if let unknown = body.keys.sorted().first(where: { !allowed.contains($0) }) {
+            throw OperationError.invalidField(unknown, "Unknown key \(unknown).\(hint)", allowed: allowed)
+        }
     }
 
-    private func status(named name: String, field: String) throws -> ItemStatus {
-        if let s = ItemStatus.allCases.first(where: { Self.statusName($0).caseInsensitiveCompare(name) == .orderedSame }) { return s }
-        throw APIError.invalidField(field,
-                                    "Unknown status “\(name)”. `status` is the experiment status; record chat execution state "
-                                        + "(running, completed, failed) in a progress log entry instead.",
-                                    allowed: Self.statusNames)
+    /// The envelope fields a request may carry. Authorship is always `api`; nothing in a request can change it.
+    private func context(_ body: [String: Any]) throws -> OperationContext {
+        var context = OperationContext(author: .api)
+        for key in ["source_chat_id", "idempotency_key"] {
+            guard let raw = body[key], !(raw is NSNull) else { continue }
+            guard let s = raw as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw OperationError.invalidField(key, "\(key) must be a non-empty string when given.")
+            }
+            if key == "source_chat_id" { context.sourceChatID = s } else { context.idempotencyKey = s }
+        }
+        if let raw = body["expected_revision"], !(raw is NSNull) {
+            guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue == n.doubleValue.rounded() else {
+                throw OperationError.invalidField("expected_revision", "expected_revision must be an integer.")
+            }
+            context.expectedRevision = n.intValue
+        }
+        return context
     }
 
-    private func requireItem(_ id: String) throws -> Item {
-        guard let item = store.item(id) else { throw APIError.taskNotFound(id) }
-        return item
+    private func int(_ r: APIRequest, _ key: String) throws -> Int? {
+        guard let raw = r.query[key] else { return nil }
+        guard let n = Int(raw) else { throw OperationError.invalidField(key, "\(key) must be an integer.") }
+        return n
     }
 
-    // MARK: Endpoints
+    // MARK: Shared operations
+
+    private func discovery() -> [String: Any] {
+        [
+            "api_version": Self.version,
+            "invoke": "POST /v1/tools/{name} with {\"arguments\": {...}, \"expected_revision\"?, \"idempotency_key\"?, \"source_chat_id\"?}",
+            "request_schema": Schema.object([
+                "arguments": Schema.object([:], required: [], closed: false),
+                "expected_revision": Schema.integer("Only for operations that change an existing item or project; see each operation's expected_revision."),
+                "idempotency_key": Schema.string("For mutations: replaying the same request returns the original response without repeating it."),
+                "source_chat_id": Schema.string("Recorded on the audit entries the request writes."),
+            ], required: []),
+            "envelope_schema": OperationRegistry.envelopeSchema,
+            "error_schema": Schema.error,
+            "statuses": statusTable(),
+            "operations": OperationRegistry.all.map(\.discovery),
+        ]
+    }
+
+    private func statusTable() -> [String: Any] {
+        ["values": ItemStatus.allCases.map { ["value": $0.rawValue, "alias": $0.label(for: .experiment), "open": $0.isOpen] },
+         "aliases": Dictionary(uniqueKeysWithValues: StatusName.aliases.map { ($0.key, $0.value.rawValue) })]
+    }
+
+    private func invoke(_ name: String, _ r: APIRequest) throws -> APIResponse {
+        let body = try body(r, allowEmpty: true)
+        try checkKeys(body, ["arguments", "expected_revision", "idempotency_key", "source_chat_id"])
+        var arguments: [String: Any] = [:]
+        if let raw = body["arguments"], !(raw is NSNull) {
+            guard let dict = raw as? [String: Any] else {
+                throw OperationError.invalidField("arguments", "arguments must be a JSON object.")
+            }
+            arguments = dict
+        }
+        let response = service.invoke(name, arguments, context: try context(body))
+        return .json(response.error?.httpStatus ?? 200, response.body)
+    }
+
+    /// Runs an operation for a v1 endpoint. Errors keep their v1 codes: a missing item is `task_not_found`, and a
+    /// revision conflict carries the task in its v1 shape.
+    private func call(_ name: String, _ arguments: [String: Any], _ context: OperationContext) throws -> (result: [String: Any], replayed: Bool) {
+        let response = service.invoke(name, arguments, context: context)
+        if var error = response.error {
+            if error.code == "item_not_found" {
+                let id = error.details["item_id"] as? String ?? ""
+                error = OperationError(code: "task_not_found", message: "No task with id \(id).", details: ["task_id": id])
+            } else if error.code == "revision_conflict", let item = error.details["item"] as? [String: Any], let id = item["id"] as? String {
+                var details = error.details
+                details.removeValue(forKey: "item")
+                details["task"] = try legacyTask(id, logLimit: 0)
+                error = OperationError(code: error.code, message: error.message, details: details)
+            }
+            throw error
+        }
+        return (response.body["result"] as? [String: Any] ?? [:], response.replayed)
+    }
+
+    // MARK: v1 endpoints
 
     private func statuses() -> APIResponse {
         .json(200, [
             "statuses": ItemStatus.allCases.map { ["name": Self.statusName($0), "open": $0.isOpen] },
-            "outcomes": Self.outcomeNames,
-            "updatable_fields": Self.updatableFields,
-            "creatable_fields": Self.creatableFields,
+            "canonical": statusTable(),
+            "outcomes": ExperimentOutcome.allCases.map(\.rawValue),
+            "updatable_fields": OperationRegistry.named("update_item")!.argumentNames.filter { $0 != "id" },
+            "creatable_fields": OperationRegistry.named("create_item")!.argumentNames,
             "kinds": ItemKind.allCases.map(\.rawValue),
             "project_types": ProjectType.allCases.map(\.rawValue),
             "project_statuses": ProjectStatus.allCases.map(\.rawValue),
-            "project_fields": Self.projectFields,
+            "project_fields": OperationRegistry.named("create_project")!.argumentNames,
         ])
     }
 
     private func listProjects(_ r: APIRequest) throws -> APIResponse {
         try checkQuery(r, allowed: ["include_archived"])
-        let includeArchived = r.query["include_archived"] == "true"
-        let list = store.projects.filter { includeArchived || $0.status != .archived }
-        return .json(200, ["projects": list.map(projectJSON)])
+        let result = try call("list_projects", ["include_archived": r.query["include_archived"] == "true"], OperationContext(author: .api)).result
+        return .json(200, ["projects": result["projects"] ?? []])
     }
 
     private func createProject(_ r: APIRequest) throws -> APIResponse {
         let body = try body(r)
-        let keys = ["fields", "source_chat_id", "idempotency_key"]
-        if let unknown = body.keys.sorted().first(where: { !keys.contains($0) }) {
-            throw APIError.invalidField(unknown, "Unknown key \(unknown). Put project fields under `fields`.", allowed: keys)
-        }
+        try checkKeys(body, ["fields", "source_chat_id", "idempotency_key"], hint: " Put project fields under `fields`.")
         guard let fields = body["fields"] as? [String: Any] else {
-            throw APIError.invalidField("fields", "`fields` must be an object of project fields; `name` is required.",
-                                        allowed: Self.projectFields)
+            throw OperationError.invalidField("fields", "`fields` must be an object of project fields; `name` is required.",
+                                              allowed: OperationRegistry.named("create_project")!.argumentNames)
         }
-        let sourceChatID = try optionalString(body, "source_chat_id")
-        let key = try optionalString(body, "idempotency_key")
-        if let unknown = fields.keys.sorted().first(where: { !Self.projectFields.contains($0) }) {
-            throw APIError.invalidField(unknown, "\(unknown) is not a project field.", allowed: Self.projectFields)
-        }
-        func string(_ name: String) throws -> String? {
-            guard let raw = fields[name], !(raw is NSNull) else { return nil }
-            guard let s = raw as? String else { throw APIError.invalidField(name, "\(name) must be a string.") }
-            return s
-        }
-        func choice<E: RawRepresentable & CaseIterable>(_ name: String, _ type: E.Type) throws -> E? where E.RawValue == String {
-            guard let s = try string(name) else { return nil }
-            guard let v = E(rawValue: s) else { throw APIError.invalidField(name, "Unknown \(name) \(s).", allowed: E.allCases.map(\.rawValue)) }
-            return v
-        }
-
-        let name = try string("name")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !name.isEmpty else { throw APIError.invalidField("name", "name is required and must not be empty.") }
-        let type = try choice("type", ProjectType.self) ?? .research
-        var draft = Project(id: "", name: name, type: type)
-        if let summary = try string("summary") { draft.summary = summary }
-        if let status = try choice("status", ProjectStatus.self) { draft.status = status }
-        if let deadline = try string("deadline") {
-            guard let d = Self.day(deadline) else { throw APIError.invalidField("deadline", "deadline must be YYYY-MM-DD.") }
-            draft.deadline = d
-        }
-        if let color = try string("color") {
-            guard Project.palette.contains(color) else { throw APIError.invalidField("color", "Unknown color.", allowed: Project.palette) }
-            draft.color = color
-        }
-        if let symbol = try string("symbol") {
-            guard Project.symbols.contains(symbol) else { throw APIError.invalidField("symbol", "Unknown symbol.", allowed: Project.symbols) }
-            draft.symbol = symbol
-        }
-
-        if let key, let existing = try store.logEntry(idempotencyKey: key) {
-            // Matched on the "created" entry, so a project renamed since still counts as the same request.
-            guard existing.kind == "created", existing.itemID == nil, let id = existing.projectID, store.project(id) != nil,
-                  existing.sourceChatID == sourceChatID, existing.text == "Created \(type.label.lowercased()) project “\(name)”" else {
-                throw APIError(status: 409, code: "idempotency_conflict",
-                               message: "idempotency_key was already used for a different request. Use a new key for a new project.",
-                               details: ["existing_entry": Self.logJSON(existing)])
-            }
-            return .json(200, ["project": try storedProject(id), "duplicate": true])
-        }
-        if let same = store.projects.first(where: { $0.status != .archived && $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
-            throw APIError(status: 409, code: "project_exists",
-                           message: "A project named “\(same.name)” already exists. Use its id, or pick another name.",
-                           details: ["project": projectJSON(same)])
-        }
-
-        let created: Project
-        do {
-            created = try store.insertProject(draft, author: .api, sourceChatID: sourceChatID, idempotencyKey: key)
-        } catch {
-            throw APIError.storage(error)
-        }
-        return .json(201, ["project": try storedProject(created.id), "duplicate": false])
-    }
-
-    private func optionalString(_ body: [String: Any], _ key: String) throws -> String? {
-        guard let raw = body[key], !(raw is NSNull) else { return nil }
-        guard let s = raw as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw APIError.invalidField(key, "\(key) must be a non-empty string when given.")
-        }
-        return s
-    }
-
-    /// The project as stored in the database, not as cached in memory.
-    private func storedProject(_ id: String) throws -> [String: Any] {
-        guard let p = try store.storedProject(id) else {
-            throw APIError(status: 500, code: "storage_error", message: "The project was not found after saving.")
-        }
-        return projectJSON(p)
-    }
-
-    private func projectJSON(_ p: Project) -> [String: Any] {
-        ["id": p.id, "name": p.name, "type": p.type.rawValue, "status": p.status.rawValue, "summary": p.summary,
-         "deadline": p.deadline.map(Self.dayString) ?? NSNull(), "color": p.color, "symbol": p.symbol,
-         "created_at": Self.iso(p.createdAt)]
+        let (result, replayed) = try call("create_project", fields, try context(body))
+        let id = (result["project"] as? [String: Any])?["id"] as? String
+        let current: Any = store.project(id).map(service.serializer.project) ?? result["project"] ?? NSNull()
+        return .json(replayed ? 200 : 201, ["project": current, "duplicate": replayed])
     }
 
     private func listTasks(_ r: APIRequest) throws -> APIResponse {
         try checkQuery(r, allowed: ["project_id", "title", "chat_id", "status", "kind", "limit"])
-        var list = store.items
-        if let pid = r.query["project_id"] {
-            if pid == "none" {
-                list = list.filter { $0.projectID == nil }
-            } else {
-                guard store.project(pid) != nil else {
-                    throw APIError(status: 404, code: "project_not_found", message: "No project with id \(pid).", details: ["project_id": pid])
-                }
-                list = list.filter { $0.projectID == pid }
-            }
-        }
-        if let title = r.query["title"]?.trimmingCharacters(in: .whitespaces), !title.isEmpty {
-            list = list.filter { $0.title.localizedCaseInsensitiveContains(title) }
-        }
-        if let chat = r.query["chat_id"] { list = list.filter { $0.chatIDs.contains(chat) } }
-        if let name = r.query["status"] {
-            let s = try status(named: name, field: "status")
-            list = list.filter { $0.status == s }
-        }
-        if let raw = r.query["kind"] {
-            guard let kind = ItemKind(rawValue: raw) else {
-                throw APIError.invalidField("kind", "Unknown kind \(raw).", allowed: ItemKind.allCases.map(\.rawValue))
-            }
-            list = list.filter { $0.kind == kind }
-        }
-        list.sort { $0.updatedAt > $1.updatedAt }
-        let max = try limit(r, "limit", default: 100, max: 500)
-        return .json(200, ["total": list.count, "tasks": list.prefix(max).map(summary)])
+        var args: [String: Any] = ["status": r.query["status"] ?? "any", "sort": "updated", "limit": try int(r, "limit") ?? 100]
+        for key in ["project_id", "title", "chat_id", "kind"] { if let v = r.query[key] { args[key] = v } }
+        let result = try call("list_items", args, OperationContext(author: .api)).result
+        let ids = (result["items"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
+        return .json(200, ["total": result["total"] ?? 0, "tasks": ids.compactMap { store.item($0) }.map(legacySummary)])
     }
 
     private func getTask(_ id: String, _ r: APIRequest) throws -> APIResponse {
         try checkQuery(r, allowed: ["log_limit"])
-        let logLimit = try limit(r, "log_limit", default: 50, max: Self.maxLogLimit)
-        return .json(200, ["task": try stored(id, logLimit: logLimit)])
+        let logLimit = min(max(try int(r, "log_limit") ?? 50, 1), Self.maxLogLimit)
+        _ = try call("get_item", ["id": id, "log_limit": logLimit], OperationContext(author: .api))
+        return .json(200, ["task": try legacyTask(id, logLimit: logLimit)])
+    }
+
+    /// v1 semantics on top of create_item: `kind` defaults to experiment (or the project's kind for personal and misc
+    /// projects), and `project_id: null` means no project.
+    private func createTask(_ r: APIRequest) throws -> APIResponse {
+        let body = try body(r)
+        try checkKeys(body, ["fields", "source_chat_id", "idempotency_key"], hint: " Put task fields under `fields`.")
+        guard var fields = body["fields"] as? [String: Any] else {
+            throw OperationError.invalidField("fields", "`fields` must be an object of task fields; `title` is required.",
+                                              allowed: OperationRegistry.named("create_item")!.argumentNames)
+        }
+        if fields["project_id"] is NSNull { fields.removeValue(forKey: "project_id") }
+        if fields["kind"] == nil || fields["kind"] is NSNull {
+            let type = store.project(fields["project_id"] as? String)?.type ?? .research
+            fields["kind"] = (type == .research ? ItemKind.experiment : type.defaultKind).rawValue
+        }
+        let (result, replayed) = try call("create_item", fields, try context(body))
+        let id = (result["item"] as? [String: Any])?["id"] as? String ?? ""
+        return .json(replayed ? 200 : 201, ["task": try legacyTask(id, logLimit: 50), "duplicate": replayed])
     }
 
     private func updateTask(_ id: String, _ r: APIRequest) throws -> APIResponse {
         let body = try body(r)
-        if let unknown = body.keys.sorted().first(where: { $0 != "fields" && $0 != "expected_revision" }) {
-            throw APIError.invalidField(unknown, "Unknown key \(unknown). Put task fields under `fields`.",
-                                        allowed: ["expected_revision", "fields"])
+        try checkKeys(body, ["fields", "expected_revision", "idempotency_key", "source_chat_id"], hint: " Put task fields under `fields`.")
+        guard var fields = body["fields"] as? [String: Any] else {
+            throw OperationError.invalidField("fields", "`fields` must be an object of task fields to change.",
+                                              allowed: OperationRegistry.named("update_item")!.argumentNames.filter { $0 != "id" })
         }
-        guard let fields = body["fields"] as? [String: Any] else {
-            throw APIError.invalidField("fields", "`fields` must be an object of task fields to change.", allowed: Self.updatableFields)
-        }
-        var expected: Int?
-        if let raw = body["expected_revision"], !(raw is NSNull) {
-            guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue == Double(n.intValue) else {
-                throw APIError.invalidField("expected_revision", "expected_revision must be an integer.")
-            }
-            expected = n.intValue
-        }
-
-        let current = try requireItem(id)
-        if let expected, expected != current.revision {
-            throw APIError(status: 409, code: "revision_conflict",
-                           message: "The task is at revision \(current.revision), not \(expected). Re-read it, reapply your change, and retry.",
-                           details: ["expected_revision": expected, "current_revision": current.revision,
-                                     "task": try stored(id, logLimit: 0)])
-        }
-        var item = current
-        for key in fields.keys.sorted() {
-            try apply(key, fields[key]!, to: &item)
-        }
-        do {
-            try store.saveItem(item, author: .api)
-        } catch {
-            throw APIError.storage(error)
-        }
-        let saved = try stored(id, logLimit: 50)
-        let changed = fields.keys.sorted().filter { key in
-            Self.fieldValue(key, current) != Self.fieldValue(key, store.item(id) ?? current)
-        }
-        return .json(200, ["task": saved, "changed": changed])
+        if fields["id"] != nil { throw OperationError.invalidField("id", "The task id goes in the URL, not in `fields`.") }
+        if fields["project_id"] is NSNull { fields["project_id"] = "" }
+        let requested = fields.keys.sorted()
+        fields["id"] = id
+        let (result, _) = try call("update_item", fields, try context(body))
+        let changedFields = Set(result["changed"] as? [String] ?? [])
+        let fieldFor = ["progress": "progress_current", "progress_add": "progress_current", "append_notes": "notes"]
+        let changed = requested.filter { changedFields.contains(fieldFor[$0] ?? $0) }
+        return .json(200, ["task": try legacyTask(id, logLimit: 50), "changed": changed])
     }
 
-    private func apply(_ key: String, _ value: Any, to item: inout Item) throws {
-        func string() throws -> String {
-            guard let s = value as? String else { throw APIError.invalidField(key, "\(key) must be a string.") }
-            return s
-        }
-        switch key {
-        case "title":
-            let t = try string().trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !t.isEmpty else { throw APIError.invalidField(key, "title must not be empty.") }
-            item.title = t
-        case "status": item.status = try status(named: try string(), field: key)
-        case "project_id":
-            if value is NSNull {
-                item.projectID = nil
-            } else {
-                let pid = try string()
-                guard store.project(pid) != nil else { throw APIError.invalidField(key, "No project with id \(pid). Use null for no project.") }
-                item.projectID = pid
-            }
-        case "notes": item.notes = try string()
-        case "hypothesis": item.hypothesis = try string()
-        case "setup": item.setup = try string()
-        case "compute": item.compute = try string()
-        case "results": item.results = try string()
-        case "conclusion": item.conclusion = try string()
-        case "outcome":
-            guard let o = ExperimentOutcome(rawValue: try string()) else {
-                throw APIError.invalidField(key, "Unknown outcome.", allowed: Self.outcomeNames)
-            }
-            item.outcome = o
-        case "metrics":
-            guard let list = value as? [[String: Any]] else { throw APIError.invalidField(key, "metrics must be an array of {name, value}.") }
-            item.metrics = try list.map { m in
-                guard let name = m["name"] as? String, !name.isEmpty else { throw APIError.invalidField(key, "Each metric needs a non-empty string name.") }
-                if let s = m["value"] as? String { return Metric(name: name, value: s) }
-                if let n = m["value"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { return Metric(name: name, value: n.stringValue) }
-                throw APIError.invalidField(key, "Metric \(name) needs a string or number value.")
-            }
-        case "chat_ids":
-            guard let ids = value as? [String], ids.allSatisfy({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else {
-                throw APIError.invalidField(key, "chat_ids must be an array of non-empty strings (it replaces the current list).")
-            }
-            item.chatIDs = ids.reduce(into: []) { if !$0.contains($1) { $0.append($1) } }
-        default:
-            throw APIError.invalidField(key, "\(key) is not an updatable field.", allowed: Self.updatableFields)
-        }
-    }
-
-    private func createTask(_ r: APIRequest) throws -> APIResponse {
-        let body = try body(r)
-        let keys = ["fields", "source_chat_id", "idempotency_key"]
-        if let unknown = body.keys.sorted().first(where: { !keys.contains($0) }) {
-            throw APIError.invalidField(unknown, "Unknown key \(unknown). Put task fields under `fields`.", allowed: keys)
-        }
-        guard let fields = body["fields"] as? [String: Any] else {
-            throw APIError.invalidField("fields", "`fields` must be an object of task fields; `title` is required.",
-                                        allowed: Self.creatableFields)
-        }
-        let sourceChatID = try optionalString(body, "source_chat_id")
-        let key = try optionalString(body, "idempotency_key")
-        guard fields["title"] != nil else { throw APIError.invalidField("title", "title is required.") }
-
-        var draft = Item(id: "", title: "", status: .todo)
-        for name in fields.keys.sorted() where name != "kind" {
-            try apply(name, fields[name]!, to: &draft)
-        }
-        // Without an explicit kind, a task gets the kind its project's type implies (experiment for research work).
-        if let raw = fields["kind"] {
-            guard let s = raw as? String, let kind = ItemKind(rawValue: s) else {
-                throw APIError.invalidField("kind", "Unknown kind.", allowed: ItemKind.allCases.map(\.rawValue))
-            }
-            draft.kind = kind
-        } else {
-            let type = store.project(draft.projectID)?.type ?? .research
-            draft.kind = type == .research ? .experiment : type.defaultKind
-        }
-
-        if let key, let existing = try store.logEntry(idempotencyKey: key) {
-            // The "created" entry records the kind and title the task was created with, so later edits don't matter.
-            let createdText = "Created \(draft.kind.label.lowercased()) “\(draft.title)”"
-            guard existing.kind == "created", let id = existing.itemID, store.item(id) != nil,
-                  existing.sourceChatID == sourceChatID, existing.text == createdText else {
-                throw APIError(status: 409, code: "idempotency_conflict",
-                               message: "idempotency_key was already used for a different request. Use a new key for a new task.",
-                               details: ["existing_entry": Self.logJSON(existing)])
-            }
-            return .json(200, ["task": try stored(id, logLimit: 50), "duplicate": true])
-        }
-
-        let created: Item
-        do {
-            created = try store.insertItem(draft, author: .api, sourceChatID: sourceChatID, idempotencyKey: key)
-        } catch {
-            throw APIError.storage(error)
-        }
-        return .json(201, ["task": try stored(created.id, logLimit: 50), "duplicate": false])
-    }
-
+    /// Appends a textual progress-log entry. It never changes a progress count; that is update_item's `progress_add`.
     private func appendProgress(_ id: String, _ r: APIRequest) throws -> APIResponse {
         let body = try body(r)
         let keys = ["text", "source_chat_id", "idempotency_key"]
-        if let unknown = body.keys.sorted().first(where: { !keys.contains($0) }) {
-            throw APIError.invalidField(unknown, "Unknown key \(unknown).", allowed: keys)
-        }
-        var values: [String: String] = [:]
+        try checkKeys(body, keys)
         for key in keys {
             guard let s = body[key] as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw APIError.invalidField(key, "\(key) is required and must be a non-empty string.")
+                throw OperationError.invalidField(key, "\(key) is required and must be a non-empty string.")
             }
-            values[key] = s
         }
-        _ = try requireItem(id)
-        let result: Store.AppendedLog
-        do {
-            result = try store.appendProgress(values["text"]!, itemID: id, sourceChatID: values["source_chat_id"]!,
-                                              idempotencyKey: values["idempotency_key"]!)
-        } catch let conflict as Store.IdempotencyConflict {
-            throw APIError(status: 409, code: "idempotency_conflict",
-                           message: "idempotency_key was already used for a different entry. Use a new key for new content.",
-                           details: ["existing_entry": Self.logJSON(conflict.existing)])
-        } catch {
-            throw APIError.storage(error)
+        let (result, replayed) = try call("add_log", ["item_id": id, "text": body["text"]!], try context(body))
+        let entryID = (result["log_entry"] as? [String: Any])?["id"] as? String
+        guard let entry = store.logs(forItem: id, limit: Self.maxLogLimit).first(where: { $0.id == entryID }),
+              let saved = try store.storedItem(id) else {
+            throw OperationError(code: "storage_error", message: "The entry was not found after saving.")
         }
-        guard let saved = try store.storedItem(id),
-              store.logs(forItem: id, limit: Self.maxLogLimit).contains(where: { $0.id == result.entry.id }) else {
-            throw APIError(status: 500, code: "storage_error", message: "The entry was not found after saving.")
-        }
-        return .json(result.duplicate ? 200 : 201, [
-            "entry": Self.logJSON(result.entry), "duplicate": result.duplicate,
-            "task_id": id, "revision": saved.revision,
-        ])
+        return .json(replayed ? 200 : 201, ["entry": Self.legacyLog(entry), "duplicate": replayed, "task_id": id, "revision": saved.revision])
     }
 
-    // MARK: Serialization
+    // MARK: v1 serialization
 
-    /// The task as stored in the database, not as cached in memory, so responses double as verification.
-    private func stored(_ id: String, logLimit: Int) throws -> [String: Any] {
-        guard let item = try store.storedItem(id) else { throw APIError.taskNotFound(id) }
-        var d = summary(item)
-        for key in ["notes", "hypothesis", "setup", "compute", "results", "conclusion", "outcome", "metrics"] {
-            d[key] = Self.fieldValue(key, item)
+    /// v1 names statuses by their experiment labels for every kind.
+    static func statusName(_ s: ItemStatus) -> String { s.label(for: .experiment) }
+
+    /// The task as stored in the database, in the v1 shape.
+    private func legacyTask(_ id: String, logLimit: Int) throws -> [String: Any] {
+        guard let i = try store.storedItem(id) else {
+            throw OperationError(code: "task_not_found", message: "No task with id \(id).", details: ["task_id": id])
         }
-        d["project"] = store.project(item.projectID).map { ["id": $0.id, "name": $0.name, "type": $0.type.rawValue] } ?? NSNull()
-        d["created_at"] = Self.iso(item.createdAt)
-        d["run_started_at"] = item.runStartedAt.map(Self.iso) ?? NSNull()
-        d["run_ended_at"] = item.runEndedAt.map(Self.iso) ?? NSNull()
-        if logLimit > 0 {
-            d["progress_log"] = store.logs(forItem: id, limit: logLimit).map(Self.logJSON)
-        }
+        var d = legacySummary(i)
+        d["notes"] = i.notes; d["hypothesis"] = i.hypothesis; d["setup"] = i.setup; d["compute"] = i.compute
+        d["results"] = i.results; d["conclusion"] = i.conclusion; d["outcome"] = i.outcome.rawValue
+        d["metrics"] = i.metrics.map { ["name": $0.name, "value": $0.value] }
+        d["project"] = store.project(i.projectID).map { ["id": $0.id, "name": $0.name, "type": $0.type.rawValue] } ?? NSNull()
+        d["created_at"] = Self.iso(i.createdAt)
+        d["run_started_at"] = i.runStartedAt.map(Self.iso) ?? NSNull()
+        d["run_ended_at"] = i.runEndedAt.map(Self.iso) ?? NSNull()
+        // Added with the shared operations, so v1 clients can read checklists and counts too.
+        d["checklist"] = i.checklist.map(service.serializer.checklistEntry)
+        d["progress_current"] = i.progressCurrent
+        d["progress_target"] = i.progressTarget ?? NSNull()
+        d["progress_unit"] = i.progressUnit
+        d["tracks_progress"] = i.tracksProgress
+        if logLimit > 0 { d["progress_log"] = store.logs(forItem: id, limit: logLimit).map(Self.legacyLog) }
         return d
     }
 
-    private func summary(_ i: Item) -> [String: Any] {
+    private func legacySummary(_ i: Item) -> [String: Any] {
         ["id": i.id, "title": i.title, "kind": i.kind.rawValue, "status": Self.statusName(i.status),
          "project_id": i.projectID ?? NSNull(), "chat_ids": i.chatIDs, "revision": i.revision, "updated_at": Self.iso(i.updatedAt)]
     }
 
-    /// JSON value of an updatable field, also used to work out which requested fields actually changed.
-    private static func fieldValue(_ key: String, _ i: Item) -> NSObject {
-        switch key {
-        case "title": i.title as NSString
-        case "status": statusName(i.status) as NSString
-        case "project_id": (i.projectID as NSString?) ?? NSNull()
-        case "notes": i.notes as NSString
-        case "hypothesis": i.hypothesis as NSString
-        case "setup": i.setup as NSString
-        case "compute": i.compute as NSString
-        case "results": i.results as NSString
-        case "conclusion": i.conclusion as NSString
-        case "outcome": i.outcome.rawValue as NSString
-        case "metrics": i.metrics.map { ["name": $0.name, "value": $0.value] } as NSArray
-        case "chat_ids": i.chatIDs as NSArray
-        default: NSNull()
-        }
-    }
-
-    private static func logJSON(_ l: LogEntry) -> [String: Any] {
+    private static func legacyLog(_ l: LogEntry) -> [String: Any] {
         ["id": l.id, "created_at": iso(l.createdAt), "kind": l.kind, "text": l.text, "author": l.author.rawValue,
          "source_chat_id": l.sourceChatID ?? NSNull(), "idempotency_key": l.idempotencyKey ?? NSNull()]
     }
-
-    /// Project deadlines are calendar days in the user's time zone, as in the app.
-    private static func dayFormatter() -> DateFormatter {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd"
-        return f
-    }
-
-    static func day(_ s: String) -> Date? {
-        guard s.wholeMatch(of: #/\d{4}-\d{2}-\d{2}/#) != nil else { return nil }
-        return dayFormatter().date(from: s)
-    }
-
-    static func dayString(_ d: Date) -> String { dayFormatter().string(from: d) }
 
     static func iso(_ d: Date) -> String {
         let f = ISO8601DateFormatter()

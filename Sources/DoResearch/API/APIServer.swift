@@ -160,13 +160,13 @@ final class APIServer {
 
     private enum Parsed {
         case incomplete
-        case failed(APIError)
+        case failed(OperationError)
         case request(APIRequest)
     }
 
     private nonisolated static func parse(_ buffer: Data) -> Parsed {
         guard let headerEnd = buffer.firstRange(of: Data("\r\n\r\n".utf8)) else {
-            return buffer.count > maxHeaderBytes ? .failed(APIError(status: 431, code: "headers_too_large", message: "Request headers are too large.")) : .incomplete
+            return buffer.count > maxHeaderBytes ? .failed(OperationError(code: "headers_too_large", message: "Request headers are too large.")) : .incomplete
         }
         guard let head = String(data: buffer[..<headerEnd.lowerBound], encoding: .utf8) else {
             return .failed(.badRequest("Request headers are not UTF-8."))
@@ -185,7 +185,7 @@ final class APIServer {
         let length = Int(headers["content-length"] ?? "0") ?? -1
         guard length >= 0 else { return .failed(.badRequest("Invalid Content-Length.")) }
         guard length <= maxBodyBytes else {
-            return .failed(APIError(status: 413, code: "payload_too_large", message: "Request bodies are limited to \(maxBodyBytes) bytes."))
+            return .failed(OperationError(code: "payload_too_large", message: "Request bodies are limited to \(maxBodyBytes) bytes."))
         }
         let bodyStart = headerEnd.upperBound
         guard buffer.count - bodyStart >= length else { return .incomplete }

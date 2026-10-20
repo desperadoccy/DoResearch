@@ -13,7 +13,8 @@ struct ToolHarness {
             let out = tools.run(name: name, input: input)
             print("• \(name): \(out.summary)\(out.isError ? "  [error]" : "")")
             if out.isError { print("    \(out.result)") }
-            return (try? JSONSerialization.jsonObject(with: Data(out.result.utf8))) as? [String: Any] ?? ["error": out.result]
+            let json = (try? JSONSerialization.jsonObject(with: Data(out.result.utf8))) as? [String: Any] ?? ["error": out.result]
+            return json["result"] as? [String: Any] ?? json
         }
         func expect(_ ok: Bool, _ what: String) {
             if !ok { failures += 1; print("  ✗ \(what)") } else { print("  ✓ \(what)") }
@@ -23,17 +24,17 @@ struct ToolHarness {
         expect((try? JSONSerialization.data(withJSONObject: AgentTools.definitions)) != nil, "tool definitions serialize to JSON")
 
         let proj = call("create_project", ["name": "Sparse Attention Paper", "deadline": "2026-11-15", "symbol": "brain"])
-        let pid = ((proj["created"] as? [String: Any])?["id"] as? String) ?? ""
+        let pid = ((proj["project"] as? [String: Any])?["id"] as? String) ?? ""
         expect(!pid.isEmpty, "project created")
 
         let code = call("create_item", ["title": "Implement block-sparse kernel", "kind": "coding", "project_id": pid,
                                         "branch": "feat/sparse", "checklist": ["forward", "backward", "tests"], "status": "in_progress"])
-        let cid = ((code["created"] as? [String: Any])?["id"] as? String) ?? ""
+        let cid = ((code["item"] as? [String: Any])?["id"] as? String) ?? ""
         expect(store.item(cid)?.checklist.count == 3, "coding item has 3 checklist steps")
 
         let exp = call("create_item", ["title": "Ablation: sparsity 0.5 vs 0.9", "kind": "experiment", "project_id": pid,
                                        "hypothesis": "ppl within 2%", "status": "in_progress"])
-        let eid = ((exp["created"] as? [String: Any])?["id"] as? String) ?? ""
+        let eid = ((exp["item"] as? [String: Any])?["id"] as? String) ?? ""
         expect(store.item(eid)?.runStartedAt != nil, "running experiment gets a run start time")
 
         _ = call("update_checklist", ["item_id": cid, "check": ["Forward", "backward"]])
@@ -55,7 +56,7 @@ struct ToolHarness {
         // Validation errors come back as tool errors, not crashes.
         let bad1 = tools.run(name: "update_item", input: ["id": "nope"])
         expect(bad1.isError, "unknown id rejected")
-        let bad2 = tools.run(name: "create_item", input: ["title": "x", "kind": "experiment", "status": "running"])
+        let bad2 = tools.run(name: "create_item", input: ["title": "x", "kind": "experiment", "status": "completed"])
         expect(bad2.isError, "invalid status rejected")
         let bad3 = tools.run(name: "update_item", input: ["id": cid, "today": "yes"])
         expect(bad3.isError, "non-boolean today rejected")
@@ -65,7 +66,8 @@ struct ToolHarness {
         let list = call("list_items", ["kind": "experiment"])
         expect((list["total"] as? Int) == 1, "list_items filters by kind")
         let projects = call("list_projects", [:])
-        expect(((projects["projects"] as? [[String: Any]])?.first?["progress"] as? [String: String])?["coding"] == "0/1 done", "project progress counts")
+        let coding = ((projects["projects"] as? [[String: Any]])?.first?["progress"] as? [String: Any])?["coding"] as? [String: Int]
+        expect(coding == ["done": 0, "total": 1], "project progress counts")
 
         let review = call("review_summary", ["days": 7])
         let exps = review["experiments"] as? [String: Any]
@@ -73,7 +75,7 @@ struct ToolHarness {
         expect(((review["coding_active"] as? [[String: Any]])?.count ?? 0) == 1, "review lists active coding")
 
         let detail = call("get_item", ["id": eid])
-        expect((detail["log"] as? [[String: Any]])?.isEmpty == false, "get_item includes the log")
+        expect(((detail["item"] as? [String: Any])?["progress_log"] as? [[String: Any]])?.isEmpty == false, "get_item includes the log")
 
         // Reload from disk and confirm persistence.
         let reopened = Store(url: url)
@@ -171,7 +173,7 @@ struct ToolHarness {
 
         // MARK: Project types separate research, personal, and misc work.
         let health = call("create_project", ["name": "Health", "type": "personal"])
-        let hid = ((health["created"] as? [String: Any])?["id"] as? String) ?? ""
+        let hid = ((health["project"] as? [String: Any])?["id"] as? String) ?? ""
         expect(store.project(hid)?.type == .personal && store.project(hid)?.symbol == ProjectType.personal.defaultSymbol,
                "personal project gets its type and default look")
         let researchOnly = call("list_projects", ["type": "research"])["projects"] as? [[String: Any]] ?? []
@@ -207,8 +209,8 @@ struct ToolHarness {
         // MARK: Measurable progress lives on one item instead of one item per unit.
         let reading = call("create_item", ["title": "Read ten papers on sparse attention", "kind": "reading",
                                            "progress_target": 10, "progress_unit": "papers"])
-        let rid = ((reading["created"] as? [String: Any])?["id"] as? String) ?? ""
-        expect((reading["created"] as? [String: Any])?["progress"] as? String == "0/10 papers", "item tracks 0/10 papers")
+        let rid = ((reading["item"] as? [String: Any])?["id"] as? String) ?? ""
+        expect((reading["item"] as? [String: Any])?["progress_label"] as? String == "0/10 papers", "item tracks 0/10 papers")
         _ = call("update_item", ["id": rid, "progress_add": 3])
         expect(store.item(rid)?.progressCurrent == 3 && store.item(rid)?.status == .inProgress, "first progress starts the item")
         _ = call("update_item", ["id": rid, "progress_add": 2])
@@ -249,6 +251,7 @@ struct ToolHarness {
         try? FileManager.default.removeItem(at: url5)
 
         await APIHarness.run(expect: expect)
+        await ParityHarness.run(expect: expect)
         await ProviderHarness.run(expect: expect)
 
         print(failures == 0 ? "\nAll checks passed." : "\n\(failures) check(s) failed.")

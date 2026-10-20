@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build
 swiftc -parse-as-library -swift-version 5 -target "$(uname -m)-apple-macos14.0" -lsqlite3 \
-  Sources/DoResearch/Data/*.swift Sources/DoResearch/Agent/*.swift Sources/DoResearch/API/*.swift Tests/*.swift \
+  Sources/DoResearch/Data/*.swift Sources/DoResearch/Agent/*.swift Sources/DoResearch/API/*.swift Sources/DoResearch/Operations/*.swift Tests/*.swift \
   -o build/tool-harness
 
 LOGDIR=$(mktemp -d)

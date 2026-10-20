@@ -234,6 +234,26 @@ enum APIHarness {
         let s6 = Store(url: url6)
         expect(s6.item("old")?.revision == 1 && s6.item("old")?.chatIDs == [], "v4 → v5 starts items at revision 1")
         try? FileManager.default.removeItem(at: url6)
+
+        // MARK: Migration from schema v5 reserves idempotency keys recorded on log entries.
+        let url7 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("dr-harness-\(UUID().uuidString).sqlite")
+        do {
+            let db = try Database(url: url7)
+            try db.execute("DROP TABLE idempotency")
+            try db.execute("ALTER TABLE projects DROP COLUMN revision")
+            try db.execute("PRAGMA user_version = 5")
+            let now = Date().timeIntervalSince1970
+            try db.execute("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?,?,?,?)", ["p", "Old", now, now])
+            try db.execute("INSERT INTO items (id, title, kind, status, created_at, updated_at) VALUES (?,?,?,?,?,?)", ["old", "Old", "task", "todo", now, now])
+            try db.execute("INSERT INTO logs (id, item_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?)",
+                           ["l1", "old", "note", "Epoch 1", "api", now, "c", "old-key"])
+        } catch { expect(false, "set up v5 database: \(error)") }
+        let s7 = Store(url: url7)
+        expect(s7.project("p")?.revision == 1, "v5 → v6 starts projects at revision 1")
+        let reusedOld = OperationService(store: s7).invoke("add_log", ["item_id": "old", "text": "Epoch 1"],
+                                                        context: OperationContext(author: .api, sourceChatID: "c", idempotencyKey: "old-key"))
+        expect(reusedOld.error?.code == "idempotency_conflict" && s7.logs(forItem: "old").count == 1, "keys used before v6 stay reserved")
+        try? FileManager.default.removeItem(at: url7)
     }
 
     /// Starts the real listener on a random port and talks to it with URLSession.
@@ -284,6 +304,16 @@ enum APIHarness {
         expect(s3 == 201 && store.item(madeID)?.title == "Created over HTTP", "HTTP: create_task")
         let (s4, madeProject) = await send("POST", "/projects", token: token, body: ["fields": ["name": "HTTP Project"], "idempotency_key": "http-p1"])
         expect(s4 == 201 && store.project((madeProject["project"] as? [String: Any])?["id"] as? String)?.name == "HTTP Project", "HTTP: create_project")
+
+        let (s5, tools) = await send("GET", "/tools", token: token)
+        expect(s5 == 200 && (tools["operations"] as? [[String: Any]])?.count == OperationRegistry.all.count, "HTTP: GET /v1/tools")
+        let (s6, invoked) = await send("POST", "/tools/update_item", token: token,
+                                       body: ["arguments": ["id": taskID, "progress_target": 3, "progress_add": 2], "source_chat_id": "http-chat", "idempotency_key": "http-tool-1"])
+        let invokedItem = (invoked["result"] as? [String: Any])?["item"] as? [String: Any]
+        expect(s6 == 200 && invokedItem?["progress_current"] as? Int == 2 && store.item(taskID)?.progressCurrent == 2, "HTTP: POST /v1/tools/update_item")
+        expect(store.logs(forItem: taskID).first { $0.kind == "progress" }?.sourceChatID == "http-chat", "HTTP: tool call audit keeps its source chat")
+        let (s7, bad) = await send("POST", "/tools/update_item", token: token, body: ["arguments": ["id": "nope"]])
+        expect(s7 == 404 && (bad["error"] as? [String: Any])?["code"] as? String == "item_not_found", "HTTP: tool errors use their status codes")
 
         server.regenerateToken()
         expect(await send("GET", "/tasks", token: token).0 == 401, "HTTP: old token stops working after regenerating")
