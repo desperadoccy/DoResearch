@@ -43,6 +43,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/tasks?chat_id=$CODEX_CHAT_ID"
 | Interface | Endpoint |
 |---|---|
 | `list_projects` | `GET /v1/projects` |
+| `create_project` | `POST /v1/projects` |
 | `list_tasks` | `GET /v1/tasks` |
 | `create_task` | `POST /v1/tasks` |
 | `get_task` | `GET /v1/tasks/{id}` |
@@ -77,7 +78,10 @@ Names are matched case-insensitively on input and always returned as above. **Ch
   "outcomes": ["pending", "supported", "refuted", "inconclusive", "failed"],
   "updatable_fields": ["title", "status", …],
   "creatable_fields": ["kind", "title", "status", …],
-  "kinds": ["coding", "experiment", …]
+  "kinds": ["coding", "experiment", …],
+  "project_types": ["research", "personal", "misc"],
+  "project_statuses": ["active", "paused", "done", "archived"],
+  "project_fields": ["name", "type", "summary", "status", "deadline", "color", "symbol"]
 }
 ```
 
@@ -153,10 +157,64 @@ The summary fields, plus:
 Query: `include_archived=true` (optional; default excludes archived projects).
 
 ```json
-{"projects": [{"id": "b7x2n4kc", "name": "Sparse Attention", "type": "research", "status": "active"}]}
+{"projects": [ /* projects */ ]}
 ```
 
-`type`: `research`, `personal`, `misc`. `status`: `active`, `paused`, `done`, `archived`. Project ids are stable.
+A project:
+
+```json
+{
+  "id": "b7x2n4kc",
+  "name": "Sparse Attention",
+  "type": "research",
+  "status": "active",
+  "summary": "NeurIPS 2027 submission",
+  "deadline": "2027-05-15",
+  "color": "blue",
+  "symbol": "brain",
+  "created_at": "2026-10-10T14:00:00.000Z"
+}
+```
+
+`type`: `research`, `personal`, `misc`. `status`: `active`, `paused`, `done`, `archived`. `deadline` is a calendar day or `null`. Project ids are stable.
+
+### `POST /v1/projects`
+
+```json
+{
+  "fields": {"name": "Long-Context Eval", "type": "research", "summary": "NeurIPS 2027", "deadline": "2027-05-15"},
+  "source_chat_id": "codex-3",
+  "idempotency_key": "codex-3/project-long-context"
+}
+```
+
+| Field | Type | Default |
+|---|---|---|
+| `name` | string, required | Leading and trailing spaces are trimmed. |
+| `type` | `research`, `personal`, or `misc` | `research` |
+| `summary` | string | empty |
+| `status` | a project status | `active` |
+| `deadline` | `YYYY-MM-DD` | none |
+| `color` | one of `blue`, `purple`, `pink`, `red`, `orange`, `yellow`, `green`, `teal`, `indigo`, `gray` | the type's color |
+| `symbol` | an SF Symbol name from the app's icon set | the type's icon |
+
+When `color` or `symbol` is not allowed, the `invalid_field` error lists the allowed values in `allowed`.
+
+Project names are unique among non-archived projects, ignoring case. A name that is already taken returns `409 project_exists` with the existing project, so a chat can use it instead. An archived project's name can be reused.
+
+`source_chat_id` and `idempotency_key` are optional and work as in `create_task`: the key is stored on the project's "created" log entry, written in the same transaction as the project.
+
+| Case | Response |
+|---|---|
+| New project | `201`, `"duplicate": false` |
+| Same key, name, type, and `source_chat_id` as an earlier create | `200`, `"duplicate": true`, the project as it is now (even if it was renamed since) |
+| Key already used for a different project, a task, or a progress entry | `409 idempotency_conflict` |
+
+```json
+{"project": { /* project, read back from the database */ }, "duplicate": false}
+```
+
+The project appears in the app's sidebar immediately, and its creation is logged with author `api`.
 
 ### `GET /v1/tasks`
 
@@ -210,7 +268,7 @@ Unknown parameters are rejected (`invalid_field`), so typos don't silently widen
 | Same key, title, kind, and `source_chat_id` as an earlier create | `200`, `"duplicate": true`, the task as it is now (even if it was edited since). Nothing new is created. |
 | Key already used for a different task or for a progress entry | `409 idempotency_conflict` |
 
-Idempotency keys share one namespace with progress entries, so don't reuse a progress entry's key.
+Idempotency keys share one namespace across tasks, projects, and progress entries, so never reuse a key.
 
 ```json
 {"task": { /* task, revision 1, with its "created" log entry */ }, "duplicate": false}
@@ -302,16 +360,18 @@ Every error has this shape. `code` is stable; `message` is for people.
 | 404 | `not_found` | No such endpoint | |
 | 405 | `method_not_allowed` | Wrong HTTP method | `allowed_methods` |
 | 409 | `revision_conflict` | `expected_revision` is stale | `expected_revision`, `current_revision`, `task` |
-| 409 | `idempotency_conflict` | Key reused for a different entry or task | `existing_entry` |
+| 409 | `idempotency_conflict` | Key reused for a different entry, task, or project | `existing_entry` |
+| 409 | `project_exists` | `create_project` with the name of a non-archived project | `project` |
 | 413 | `payload_too_large` | Body over 1 MiB | |
-| 422 | `invalid_field` | Unknown or read-only field, wrong type, unknown status/outcome/kind/project, missing or empty title, unknown query parameter | `field`, and `allowed` when there is a fixed set |
+| 422 | `invalid_field` | Unknown or read-only field, wrong type, unknown status/outcome/kind/project/type/color/symbol, missing or empty title or name, bad deadline, unknown query parameter | `field`, and `allowed` when there is a fixed set |
 | 500 | `storage_error` | The database write failed; nothing was changed | |
 
 When the app is closed or the API is disabled, connections are refused.
 
 ## Typical flow for a chat
 
-1. `GET /v1/tasks?chat_id=<chat>`. If nothing matches, find the task with `?title=…` or `?project_id=…`, then link it: `PATCH` with `chat_ids` = current list + your chat id, and `expected_revision`. If the task doesn't exist yet, `POST /v1/tasks` with your chat id in `chat_ids` and an idempotency key.
-2. When the experiment changes phase or setup, `PATCH` the fields with `expected_revision`. On `409`, re-read and retry.
-3. Log progress with `POST …/progress` and a deterministic idempotency key, so retries never duplicate entries.
-4. To verify, `GET /v1/tasks/{id}` and compare the fields and `revision`.
+1. To file work under a project, find it with `GET /v1/projects`, or create it with `POST /v1/projects` and an idempotency key. On `409 project_exists`, use the project in the error.
+2. `GET /v1/tasks?chat_id=<chat>`. If nothing matches, find the task with `?title=…` or `?project_id=…`, then link it: `PATCH` with `chat_ids` = current list + your chat id, and `expected_revision`. If the task doesn't exist yet, `POST /v1/tasks` with your chat id in `chat_ids` and an idempotency key.
+3. When the experiment changes phase or setup, `PATCH` the fields with `expected_revision`. On `409`, re-read and retry.
+4. Log progress with `POST …/progress` and a deterministic idempotency key, so retries never duplicate entries.
+5. To verify, `GET /v1/tasks/{id}` and compare the fields and `revision`.

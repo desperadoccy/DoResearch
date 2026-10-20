@@ -153,6 +153,59 @@ enum APIHarness {
         expect(code(call("POST", "/v1/tasks", body: ["fields": ["title": "x"]], token: nil).1) == "unauthorized", "create needs the token")
         expect(store.items.count == countBefore, "rejected creates add nothing")
 
+        // Creating projects
+        let newProject: [String: Any] = [
+            "fields": ["name": "  Long-Context Eval ", "summary": "NeurIPS 2027", "deadline": "2027-05-15", "symbol": "brain"],
+            "source_chat_id": "codex-3", "idempotency_key": "codex-3/project-1",
+        ]
+        let (projStatus, projCreated) = call("POST", "/v1/projects", body: newProject)
+        let np = projCreated["project"] as? [String: Any] ?? [:]
+        let npID = np["id"] as? String ?? ""
+        expect(projStatus == 201 && projCreated["duplicate"] as? Bool == false && np["name"] as? String == "Long-Context Eval"
+               && np["type"] as? String == "research" && np["status"] as? String == "active" && np["deadline"] as? String == "2027-05-15"
+               && np["symbol"] as? String == "brain" && np["color"] as? String == ProjectType.research.defaultColor,
+               "create_project → 201 with saved project and defaults")
+        expect(store.project(npID)?.summary == "NeurIPS 2027", "created project is in the store the UI reads")
+        let projectLog = store.logs(since: .distantPast, projectID: npID).first
+        expect(projectLog?.kind == "created" && projectLog?.author == .api && projectLog?.sourceChatID == "codex-3",
+               "project creation logged with author api and source chat")
+        let listed = (call("GET", "/v1/projects").1["projects"] as? [[String: Any]])?.first { $0["id"] as? String == npID }
+        expect(listed?["summary"] as? String == "NeurIPS 2027" && listed?["deadline"] as? String == "2027-05-15", "list_projects shows the new project in full")
+
+        var renamedProject = store.project(npID)!
+        renamedProject.name = "Renamed project"
+        store.updateProject(renamedProject)
+        let (replayProjStatus, replayProj) = call("POST", "/v1/projects", body: newProject)
+        expect(replayProjStatus == 200 && replayProj["duplicate"] as? Bool == true
+               && (replayProj["project"] as? [String: Any])?["id"] as? String == npID, "replayed create_project returns the same project")
+        expect(code(call("POST", "/v1/projects", body: ["fields": ["name": "Else"], "source_chat_id": "codex-3", "idempotency_key": "codex-3/project-1"]).1)
+               == "idempotency_conflict", "project key reused for another project → idempotency_conflict")
+        expect(code(call("POST", "/v1/projects", body: ["fields": ["name": "x"], "idempotency_key": "codex-2/create-1"]).1) == "idempotency_conflict",
+               "project key that belongs to a task → idempotency_conflict")
+
+        let exists = call("POST", "/v1/projects", body: ["fields": ["name": "sparse attention"]])
+        expect(exists.0 == 409 && code(exists.1) == "project_exists"
+               && ((exists.1["error"] as? [String: Any])?["project"] as? [String: Any])?["id"] as? String == project.id,
+               "same name (case-insensitive) → 409 project_exists with the existing project")
+        var archived = store.project(personal.id)!
+        archived.status = .archived
+        store.updateProject(archived)
+        expect(call("POST", "/v1/projects", body: ["fields": ["name": "Health", "type": "personal"]]).0 == 201,
+               "an archived project's name can be reused")
+        let misc = call("POST", "/v1/projects", body: ["fields": ["name": "Errands", "type": "misc", "status": "paused"]]).1["project"] as? [String: Any]
+        expect(misc?["type"] as? String == "misc" && misc?["status"] as? String == "paused" && misc?["symbol"] as? String == ProjectType.misc.defaultSymbol,
+               "type and status set; look follows the type")
+
+        let projectCount = store.projects.count
+        expect(errorField(call("POST", "/v1/projects", body: ["fields": ["summary": "x"]]).1) == "name", "create_project without name rejected")
+        expect(errorField(call("POST", "/v1/projects", body: ["fields": ["name": "x", "type": "work"]]).1) == "type", "unknown project type rejected")
+        expect(errorField(call("POST", "/v1/projects", body: ["fields": ["name": "x", "deadline": "15/05/2027"]]).1) == "deadline", "bad deadline rejected")
+        expect(errorField(call("POST", "/v1/projects", body: ["fields": ["name": "x", "color": "magenta"]]).1) == "color", "unknown color rejected")
+        expect(errorField(call("POST", "/v1/projects", body: ["fields": ["name": "x", "owner": "me"]]).1) == "owner", "unknown project field rejected")
+        expect(code(call("POST", "/v1/projects", body: ["fields": ["name": "x"]], token: nil).1) == "unauthorized", "create_project needs the token")
+        expect(store.projects.count == projectCount, "rejected project creates add nothing")
+        expect(Store(url: url).project(npID)?.deadline != nil, "created project persists")
+
         // Persistence
         let reopened = Store(url: url)
         let back = reopened.item(exp.id)
@@ -229,6 +282,8 @@ enum APIHarness {
         let (s3, made) = await send("POST", "/tasks", token: token, body: ["fields": ["title": "Created over HTTP"], "idempotency_key": "http-1"])
         let madeID = (made["task"] as? [String: Any])?["id"] as? String
         expect(s3 == 201 && store.item(madeID)?.title == "Created over HTTP", "HTTP: create_task")
+        let (s4, madeProject) = await send("POST", "/projects", token: token, body: ["fields": ["name": "HTTP Project"], "idempotency_key": "http-p1"])
+        expect(s4 == 201 && store.project((madeProject["project"] as? [String: Any])?["id"] as? String)?.name == "HTTP Project", "HTTP: create_project")
 
         server.regenerateToken()
         expect(await send("GET", "/tasks", token: token).0 == 401, "HTTP: old token stops working after regenerating")

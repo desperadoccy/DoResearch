@@ -71,6 +71,7 @@ struct TaskAPI {
                                   "conclusion", "outcome", "metrics", "chat_ids"]
     /// `kind` can be chosen only when creating a task.
     static let creatableFields = ["kind"] + updatableFields
+    static let projectFields = ["name", "type", "summary", "status", "deadline", "color", "symbol"]
 
     func handle(_ request: APIRequest) -> APIResponse {
         do {
@@ -97,8 +98,8 @@ struct TaskAPI {
             try allow(r, "GET")
             return statuses()
         case 1 where rest[0] == "projects":
-            try allow(r, "GET")
-            return try listProjects(r)
+            try allow(r, "GET", "POST")
+            return r.method == "GET" ? try listProjects(r) : try createProject(r)
         case 1 where rest[0] == "tasks":
             try allow(r, "GET", "POST")
             return r.method == "GET" ? try listTasks(r) : try createTask(r)
@@ -181,6 +182,9 @@ struct TaskAPI {
             "updatable_fields": Self.updatableFields,
             "creatable_fields": Self.creatableFields,
             "kinds": ItemKind.allCases.map(\.rawValue),
+            "project_types": ProjectType.allCases.map(\.rawValue),
+            "project_statuses": ProjectStatus.allCases.map(\.rawValue),
+            "project_fields": Self.projectFields,
         ])
     }
 
@@ -188,9 +192,99 @@ struct TaskAPI {
         try checkQuery(r, allowed: ["include_archived"])
         let includeArchived = r.query["include_archived"] == "true"
         let list = store.projects.filter { includeArchived || $0.status != .archived }
-        return .json(200, ["projects": list.map { p -> [String: Any] in
-            ["id": p.id, "name": p.name, "type": p.type.rawValue, "status": p.status.rawValue]
-        }])
+        return .json(200, ["projects": list.map(projectJSON)])
+    }
+
+    private func createProject(_ r: APIRequest) throws -> APIResponse {
+        let body = try body(r)
+        let keys = ["fields", "source_chat_id", "idempotency_key"]
+        if let unknown = body.keys.sorted().first(where: { !keys.contains($0) }) {
+            throw APIError.invalidField(unknown, "Unknown key \(unknown). Put project fields under `fields`.", allowed: keys)
+        }
+        guard let fields = body["fields"] as? [String: Any] else {
+            throw APIError.invalidField("fields", "`fields` must be an object of project fields; `name` is required.",
+                                        allowed: Self.projectFields)
+        }
+        let sourceChatID = try optionalString(body, "source_chat_id")
+        let key = try optionalString(body, "idempotency_key")
+        if let unknown = fields.keys.sorted().first(where: { !Self.projectFields.contains($0) }) {
+            throw APIError.invalidField(unknown, "\(unknown) is not a project field.", allowed: Self.projectFields)
+        }
+        func string(_ name: String) throws -> String? {
+            guard let raw = fields[name], !(raw is NSNull) else { return nil }
+            guard let s = raw as? String else { throw APIError.invalidField(name, "\(name) must be a string.") }
+            return s
+        }
+        func choice<E: RawRepresentable & CaseIterable>(_ name: String, _ type: E.Type) throws -> E? where E.RawValue == String {
+            guard let s = try string(name) else { return nil }
+            guard let v = E(rawValue: s) else { throw APIError.invalidField(name, "Unknown \(name) \(s).", allowed: E.allCases.map(\.rawValue)) }
+            return v
+        }
+
+        let name = try string("name")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !name.isEmpty else { throw APIError.invalidField("name", "name is required and must not be empty.") }
+        let type = try choice("type", ProjectType.self) ?? .research
+        var draft = Project(id: "", name: name, type: type)
+        if let summary = try string("summary") { draft.summary = summary }
+        if let status = try choice("status", ProjectStatus.self) { draft.status = status }
+        if let deadline = try string("deadline") {
+            guard let d = Self.day(deadline) else { throw APIError.invalidField("deadline", "deadline must be YYYY-MM-DD.") }
+            draft.deadline = d
+        }
+        if let color = try string("color") {
+            guard Project.palette.contains(color) else { throw APIError.invalidField("color", "Unknown color.", allowed: Project.palette) }
+            draft.color = color
+        }
+        if let symbol = try string("symbol") {
+            guard Project.symbols.contains(symbol) else { throw APIError.invalidField("symbol", "Unknown symbol.", allowed: Project.symbols) }
+            draft.symbol = symbol
+        }
+
+        if let key, let existing = try store.logEntry(idempotencyKey: key) {
+            // Matched on the "created" entry, so a project renamed since still counts as the same request.
+            guard existing.kind == "created", existing.itemID == nil, let id = existing.projectID, store.project(id) != nil,
+                  existing.sourceChatID == sourceChatID, existing.text == "Created \(type.label.lowercased()) project “\(name)”" else {
+                throw APIError(status: 409, code: "idempotency_conflict",
+                               message: "idempotency_key was already used for a different request. Use a new key for a new project.",
+                               details: ["existing_entry": Self.logJSON(existing)])
+            }
+            return .json(200, ["project": try storedProject(id), "duplicate": true])
+        }
+        if let same = store.projects.first(where: { $0.status != .archived && $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            throw APIError(status: 409, code: "project_exists",
+                           message: "A project named “\(same.name)” already exists. Use its id, or pick another name.",
+                           details: ["project": projectJSON(same)])
+        }
+
+        let created: Project
+        do {
+            created = try store.insertProject(draft, author: .api, sourceChatID: sourceChatID, idempotencyKey: key)
+        } catch {
+            throw APIError.storage(error)
+        }
+        return .json(201, ["project": try storedProject(created.id), "duplicate": false])
+    }
+
+    private func optionalString(_ body: [String: Any], _ key: String) throws -> String? {
+        guard let raw = body[key], !(raw is NSNull) else { return nil }
+        guard let s = raw as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw APIError.invalidField(key, "\(key) must be a non-empty string when given.")
+        }
+        return s
+    }
+
+    /// The project as stored in the database, not as cached in memory.
+    private func storedProject(_ id: String) throws -> [String: Any] {
+        guard let p = try store.storedProject(id) else {
+            throw APIError(status: 500, code: "storage_error", message: "The project was not found after saving.")
+        }
+        return projectJSON(p)
+    }
+
+    private func projectJSON(_ p: Project) -> [String: Any] {
+        ["id": p.id, "name": p.name, "type": p.type.rawValue, "status": p.status.rawValue, "summary": p.summary,
+         "deadline": p.deadline.map(Self.dayString) ?? NSNull(), "color": p.color, "symbol": p.symbol,
+         "created_at": Self.iso(p.createdAt)]
     }
 
     private func listTasks(_ r: APIRequest) throws -> APIResponse {
@@ -329,15 +423,8 @@ struct TaskAPI {
             throw APIError.invalidField("fields", "`fields` must be an object of task fields; `title` is required.",
                                         allowed: Self.creatableFields)
         }
-        func optionalString(_ key: String) throws -> String? {
-            guard let raw = body[key], !(raw is NSNull) else { return nil }
-            guard let s = raw as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw APIError.invalidField(key, "\(key) must be a non-empty string when given.")
-            }
-            return s
-        }
-        let sourceChatID = try optionalString("source_chat_id")
-        let key = try optionalString("idempotency_key")
+        let sourceChatID = try optionalString(body, "source_chat_id")
+        let key = try optionalString(body, "idempotency_key")
         guard fields["title"] != nil else { throw APIError.invalidField("title", "title is required.") }
 
         var draft = Item(id: "", title: "", status: .todo)
@@ -458,6 +545,21 @@ struct TaskAPI {
         ["id": l.id, "created_at": iso(l.createdAt), "kind": l.kind, "text": l.text, "author": l.author.rawValue,
          "source_chat_id": l.sourceChatID ?? NSNull(), "idempotency_key": l.idempotencyKey ?? NSNull()]
     }
+
+    /// Project deadlines are calendar days in the user's time zone, as in the app.
+    private static func dayFormatter() -> DateFormatter {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }
+
+    static func day(_ s: String) -> Date? {
+        guard s.wholeMatch(of: #/\d{4}-\d{2}-\d{2}/#) != nil else { return nil }
+        return dayFormatter().date(from: s)
+    }
+
+    static func dayString(_ d: Date) -> String { dayFormatter().string(from: d) }
 
     static func iso(_ d: Date) -> String {
         let f = ISO8601DateFormatter()
