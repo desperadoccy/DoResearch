@@ -467,21 +467,42 @@ final class Store {
 
     @discardableResult
     func createProject(_ draft: Project, author: Author = .user) -> Project {
+        do {
+            return try insertProject(draft, author: author)
+        } catch {
+            report(error)
+            return draft
+        }
+    }
+
+    /// `createProject` for callers that need to know whether the write reached the database. Like `insertItem`, the
+    /// project and its "created" log entry (which carries any `idempotencyKey`) are saved together.
+    @discardableResult
+    func insertProject(_ draft: Project, author: Author = .user, sourceChatID: String? = nil,
+                       idempotencyKey: String? = nil) throws -> Project {
         var p = draft
         if p.id.isEmpty || project(p.id) != nil { p.id = ShortID.make() }
         p.createdAt = Date()
         p.updatedAt = p.createdAt
-        do {
+        try db.transaction {
             try db.execute(
                 "INSERT INTO projects (id, name, type, summary, color, symbol, status, deadline, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 [p.id, p.name, p.type.rawValue, p.summary, p.color, p.symbol, p.status.rawValue, p.deadline, p.createdAt, p.updatedAt]
             )
-            projects.append(p)
-            log(item: nil, project: p.id, kind: "created", text: "Created \(p.type.label.lowercased()) project “\(p.name)”", author: author)
-        } catch {
-            report(error)
+            try db.execute(
+                "INSERT INTO logs (id, item_id, project_id, kind, text, author, created_at, source_chat_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
+                [ShortID.make(12), nil as String?, p.id, "created", "Created \(p.type.label.lowercased()) project “\(p.name)”",
+                 author.rawValue, p.createdAt, sourceChatID, idempotencyKey]
+            )
         }
+        projects.append(p)
+        logRevision += 1
         return p
+    }
+
+    /// Reads a project straight from the database, so API writes can be verified against what was actually stored.
+    func storedProject(_ id: String) throws -> Project? {
+        try db.query("SELECT * FROM projects WHERE id = ?", [id]).first.map(Self.project(from:))
     }
 
     func updateProject(_ updated: Project, author: Author = .user) {
