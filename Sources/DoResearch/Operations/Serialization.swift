@@ -43,7 +43,8 @@ struct Serializer {
     }
 
     func checklistEntry(_ e: ChecklistEntry) -> [String: Any] {
-        ["id": e.id, "title": e.title, "done": e.done, "position": e.position]
+        ["id": e.id, "title": e.title, "done": e.done, "position": e.position, "failed": e.failed,
+         "after": e.links.map { ["id": $0.from, "condition": $0.condition.rawValue, "loop": $0.loop] }]
     }
 
     func logEntry(_ l: LogEntry) -> [String: Any] {
@@ -119,7 +120,12 @@ enum Schema {
     static let day = string("Calendar day, YYYY-MM-DD.")
 
     static var checklistEntry: [String: Any] {
-        object(["id": string("Stable id."), "title": string(), "done": boolean(), "position": integer("Order within the checklist.")])
+        object(["id": string("Stable id."), "title": string(), "done": boolean(), "position": integer("Order within the checklist."),
+                "failed": boolean("Done, but it didn't work out (follows “bad” links)."),
+                "after": array(object(["id": string("The step this link comes from."),
+                                       "condition": choice(LinkCondition.allCases.map(\.rawValue)),
+                                       "loop": boolean("Points back to an earlier step; never blocks.")]),
+                               "Incoming links of the checklist graph.")])
     }
 
     static var logEntry: [String: Any] {

@@ -176,12 +176,55 @@ struct Metric: Codable, Hashable, Identifiable {
     enum CodingKeys: String, CodingKey { case name, value }
 }
 
+/// When a checklist link is followed: always, or only for one result of the step it starts from.
+enum LinkCondition: String, Codable, CaseIterable, Hashable {
+    case always, good, bad
+
+    var label: String {
+        switch self {
+        case .always: "Always"
+        case .good: "If It Went Well"
+        case .bad: "If It Went Badly"
+        }
+    }
+}
+
+/// An incoming edge of a checklist step: `from` comes first. A loop link points back to an earlier step (or the
+/// step itself); it never blocks, and following it reopens the steps in between for another round.
+struct ChecklistLink: Hashable, Codable {
+    var from: String
+    var condition: LinkCondition = .always
+    var loop = false
+}
+
 struct ChecklistEntry: Identifiable, Hashable, Codable {
     var id: String
     var itemID: String
     var title: String
     var done: Bool
     var position: Int
+    /// Done, but it didn't work out: follows "if it went badly" links instead of "if it went well" ones.
+    var failed = false
+    /// Where the step sits on the checklist graph. `nil` until the user places it; the graph lays it out by depth.
+    var x: Double? = nil
+    var y: Double? = nil
+    /// Incoming edges from steps in the same checklist.
+    var links: [ChecklistLink] = []
+
+    /// Ids of the steps this one links from, loops included.
+    var after: [String] { links.map(\.from) }
+    /// Forward links only: the steps that must come before this one.
+    var prerequisites: [ChecklistLink] { links.filter { !$0.loop } }
+
+    /// Whether `link`, leaving a step in state (done, failed), is the path taken.
+    static func taken(_ link: ChecklistLink, done: Bool, failed: Bool) -> Bool {
+        guard done else { return false }
+        switch link.condition {
+        case .always: return true
+        case .good: return !failed
+        case .bad: return failed
+        }
+    }
 }
 
 struct Item: Identifiable, Hashable, Codable {
@@ -233,6 +276,44 @@ struct Item: Identifiable, Hashable, Codable {
 
     var checklistProgress: (done: Int, total: Int) {
         (checklist.filter(\.done).count, checklist.count)
+    }
+
+    /// Checklist steps in dependency order: every step comes after the steps it depends on, ties keep manual order.
+    var checklistInGraphOrder: [ChecklistEntry] {
+        let ids = Set(checklist.map(\.id))
+        let before = Dictionary(uniqueKeysWithValues: checklist.map { ($0.id, Set($0.prerequisites.map(\.from)).intersection(ids)) })
+        var remaining = before.mapValues(\.count)
+        var dependents: [String: [String]] = [:]
+        for e in checklist { for p in before[e.id] ?? [] { dependents[p, default: []].append(e.id) } }
+        let rank = Dictionary(uniqueKeysWithValues: checklist.enumerated().map { ($1.id, $0) })
+        let byID = Dictionary(uniqueKeysWithValues: checklist.map { ($0.id, $0) })
+        var ready = checklist.filter { remaining[$0.id] == 0 }.map(\.id)
+        var out: [ChecklistEntry] = []
+        while !ready.isEmpty {
+            ready.sort { rank[$0]! < rank[$1]! }
+            let id = ready.removeFirst()
+            out.append(byID[id]!)
+            for d in dependents[id] ?? [] {
+                remaining[d]! -= 1
+                if remaining[d] == 0 { ready.append(d) }
+            }
+        }
+        // A cycle can't be created through the app; if one exists anyway, keep its steps visible.
+        if out.count < checklist.count { out += checklist.filter { e in !out.contains { $0.id == e.id } } }
+        return out
+    }
+
+    /// A step is blocked while any step it depends on is still open. Loop links never block.
+    func isBlocked(_ entry: ChecklistEntry) -> Bool {
+        entry.prerequisites.contains { l in checklist.first { $0.id == l.from }.map { !$0.done } ?? false }
+    }
+
+    /// An open step whose prerequisites are all done but none of their links to it was taken: a branch not chosen.
+    func isSkipped(_ entry: ChecklistEntry) -> Bool {
+        guard !entry.done else { return false }
+        let pre = entry.prerequisites.compactMap { l in checklist.first { $0.id == l.from }.map { (l, $0) } }
+        guard !pre.isEmpty, pre.allSatisfy({ $0.1.done }) else { return false }
+        return !pre.contains { ChecklistEntry.taken($0.0, done: $0.1.done, failed: $0.1.failed) }
     }
 
     var tracksProgress: Bool { progressTarget != nil }

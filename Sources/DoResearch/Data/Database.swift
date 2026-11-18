@@ -297,5 +297,39 @@ final class Database {
                 try execute("PRAGMA user_version = 6")
             }
         }
+        if version < 7 {
+            try transaction {
+                let columns = try query("PRAGMA table_info(checklist)").compactMap { $0["name"]?.string }
+                if !columns.contains("x") {
+                    try execute("ALTER TABLE checklist ADD COLUMN x REAL")
+                    try execute("ALTER TABLE checklist ADD COLUMN y REAL")
+                }
+                // Checklist graph: `from_id` must be done before `to_id`. Both steps belong to the same item.
+                try execute("""
+                CREATE TABLE IF NOT EXISTS checklist_edges (
+                    from_id TEXT NOT NULL REFERENCES checklist(id) ON DELETE CASCADE,
+                    to_id TEXT NOT NULL REFERENCES checklist(id) ON DELETE CASCADE,
+                    PRIMARY KEY (from_id, to_id)
+                )
+                """)
+                try execute("CREATE INDEX IF NOT EXISTS idx_checklist_edges_to ON checklist_edges(to_id)")
+                try execute("PRAGMA user_version = 7")
+            }
+        }
+        if version < 8 {
+            try transaction {
+                let edgeColumns = try query("PRAGMA table_info(checklist_edges)").compactMap { $0["name"]?.string }
+                if !edgeColumns.contains("condition") {
+                    // `condition`: always / good / bad. `loop`: points back to an earlier step and never blocks.
+                    try execute("ALTER TABLE checklist_edges ADD COLUMN condition TEXT NOT NULL DEFAULT 'always'")
+                    try execute("ALTER TABLE checklist_edges ADD COLUMN loop INTEGER NOT NULL DEFAULT 0")
+                }
+                let columns = try query("PRAGMA table_info(checklist)").compactMap { $0["name"]?.string }
+                if !columns.contains("failed") {
+                    try execute("ALTER TABLE checklist ADD COLUMN failed INTEGER NOT NULL DEFAULT 0")
+                }
+                try execute("PRAGMA user_version = 8")
+            }
+        }
     }
 }

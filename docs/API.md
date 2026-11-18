@@ -170,7 +170,11 @@ Checking off steps doesn't change the count; logging a note doesn't change the c
   "hypothesis": "ppl within 2%", "setup": "bs=64", "compute": "4×A100", "results": "", "conclusion": "",
   "outcome": "pending", "metrics": [{"name": "ppl", "value": "18.9"}],
   "run_started_at": "2026-10-20T08:02:11+08:00", "run_ended_at": null,
-  "checklist": [{"id": "x7k2m9q4pa", "title": "Verify the data split", "done": false, "position": 0}],
+  "checklist": [
+    {"id": "x7k2m9q4pa", "title": "Verify the data split", "done": true, "failed": false, "position": 0, "after": []},
+    {"id": "p4t8w2kz9m", "title": "Run the baseline", "done": false, "failed": false, "position": 1,
+     "after": [{"id": "x7k2m9q4pa", "condition": "always", "loop": false}]}
+  ],
   "checklist_done": 0, "checklist_total": 1,
   "tracks_progress": true, "progress_current": 4, "progress_target": 10, "progress_unit": "runs", "progress_label": "4/10 runs",
   "chat_ids": ["chat-17"], "revision": 8,
@@ -178,6 +182,8 @@ Checking off steps doesn't change the count; logging a note doesn't change the c
   "progress_log": [ /* log entries, newest first */ ]
 }
 ```
+
+Checklist steps form a graph. `after` lists a step's incoming links: the step `id` that comes first, the `condition` under which the link is followed (`always`, `good`, `bad`), and whether it is a `loop`. `failed` is true for a step that is done but went badly. See [`update_checklist`](#update_checklist) for how links behave.
 
 `progress_log` is included by `get_item` (`log_limit`, default 25) and by writes (the latest 5). Lists return a compact summary: the same keys without the kind-specific fields, the checklist entries, and the log, and with `notes_preview` (the first 160 characters) instead of `notes`.
 
@@ -292,20 +298,37 @@ Rules, the same for the assistant, the API, and the app:
 ```json
 {
   "item_id": "k3mz8qpa",
-  "add": ["Verify action replay", "Run the baseline"],
+  "add": ["Evaluate", "Tune", "Write up"],
   "check": ["x7k2m9q4pa"],
+  "fail": [],
   "uncheck": [],
-  "remove": []
+  "remove": [],
+  "link": [
+    {"from": "x7k2m9q4pa", "to": "Evaluate"},
+    {"from": "Evaluate", "to": "Write up", "condition": "good"},
+    {"from": "Evaluate", "to": "Tune", "condition": "bad"},
+    {"from": "Tune", "to": "x7k2m9q4pa"}
+  ],
+  "unlink": []
 }
 ```
 
-`check`, `uncheck`, and `remove` take step ids or exact titles (case-insensitive), matched against the checklist as it was before the request.
+Steps are named by id or exact title (case-insensitive), matched against the checklist as it was before the request. `link` may also name a step added by the same request, by its title.
 
-- **All or nothing:** the request is validated as a whole and applied in one transaction. Nothing is applied if a reference matches no step (`checklist_entry_not_found`), a title matches several steps (`ambiguous_match`, with the candidates' ids), the same step appears in `check` and `uncheck` or in `remove` and either (`contradictory_operations`), or a new title is empty (`invalid_field`).
+- **Results:** `check` marks a step done with the result "went well"; `fail` marks it done with the result "went badly" (`failed: true`); `uncheck` reopens it.
+- **Links:** `{"from", "to"}` says `from` comes before `to`. `condition` is `always` (default), `good` (followed only if `from` went well), or `bad` (followed only if it went badly). Linking a pair that already exists changes its condition; linking it with the same condition changes nothing. `unlink` removes a link.
+- **Loops:** a link back to an earlier step (one `to` already leads to), or from a step to itself, is stored as a loop. Loops never block a step. When a request finishes a step (`check` or `fail`) and a loop leaving it matches the result, the loop's target, the step, and every step on a forward path between them are reopened, and a "Loop back to …" entry is logged. The loop is followed against the checklist as it is after the request, so a loop added in the same request counts.
+- **Order of application:** removals, then results, then additions, then `unlink`, then `link` in the order given, then loops.
+- **All or nothing:** the request is validated as a whole and applied in one transaction. Nothing is applied if:
+  - a reference matches no step (`checklist_entry_not_found`);
+  - a title matches several steps, including an existing step and one added by the same request (`ambiguous_match`, with the candidates);
+  - the same step appears in more than one of `check`, `fail`, `uncheck`, and `remove`, a link names a step being removed, the same link appears in both `link` and `unlink`, or the same link is given two conditions (`contradictory_operations`);
+  - `unlink` names a link that doesn't exist (`checklist_link_not_found`);
+  - a new title is empty or a condition is unknown (`invalid_field`).
 - **Order and untouched steps:** steps not named in the request keep their state and order, and new steps are appended in the order given.
 - **Revision:** it moves once per request, and only if something changed.
 
-Checking steps never changes the quantitative count. Result: `{"item_id", "revision", "changed", "checklist", "added"}`; `added` holds the new entries with their ids.
+Checking steps never changes the quantitative count. Step positions on the app's graph are layout only and aren't part of the API. Result: `{"item_id", "revision", "changed", "checklist", "added"}`; `added` holds the new entries with their ids.
 
 ### `add_log`
 
@@ -371,7 +394,8 @@ A committed replay is recognized before the revision check, so a retry of a requ
 | 422 | `invalid_field` | Unknown argument, wrong type, unknown enum value, empty title or name, count without target, bad date | `field`, and `allowed` when there is a fixed set |
 | 422 | `checklist_entry_not_found` | A checklist reference matches no step | `field`, `step` |
 | 422 | `ambiguous_match` | A checklist title matches several steps | `field`, `step`, `candidates` |
-| 422 | `contradictory_operations` | The same step in conflicting checklist actions | `fields`, `steps` |
+| 422 | `checklist_link_not_found` | `unlink` names a link that doesn't exist | `field`, `from`, `to` |
+| 422 | `contradictory_operations` | The same step or link in conflicting checklist actions, or a link to a step removed by the same request | `fields`, `steps` |
 | 500 | `storage_error` | The database write failed; nothing was changed | |
 
 When the app is closed or the API is disabled, connections are refused.

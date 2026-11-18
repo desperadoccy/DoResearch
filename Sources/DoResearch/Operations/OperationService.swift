@@ -350,33 +350,33 @@ extension OperationService {
 
         // Resolve every reference against the checklist as it is before the request, and reject the whole request
         // if any of them is missing, ambiguous, or contradicts another.
+        func notFound(_ field: String, _ key: String) -> OperationError {
+            OperationError(code: "checklist_entry_not_found", message: "No checklist step matching “\(key)” on item \(item.id).",
+                           details: ["field": field, "step": key, "item_id": item.id])
+        }
+        func ambiguous(_ field: String, _ key: String, _ candidates: [[String: Any]]) -> OperationError {
+            OperationError(code: "ambiguous_match", message: "\(candidates.count) checklist steps are titled “\(key)”. Refer to one by id.",
+                           details: ["field": field, "step": key, "candidates": candidates])
+        }
+        func existing(_ field: String, _ key: String) throws -> String {
+            if let byID = item.checklist.first(where: { $0.id == key }) { return byID.id }
+            let matches = item.checklist.filter { $0.title.lowercased() == key.lowercased() }
+            if matches.isEmpty { throw notFound(field, key) }
+            guard matches.count == 1 else { throw ambiguous(field, key, matches.map { ["id": $0.id, "title": $0.title] }) }
+            return matches[0].id
+        }
         func resolve(_ field: String) throws -> [String] {
             var ids: [String] = []
             for key in try a.stringArray(field) ?? [] {
-                let id: String
-                if let byID = item.checklist.first(where: { $0.id == key }) {
-                    id = byID.id
-                } else {
-                    let matches = item.checklist.filter { $0.title.lowercased() == key.lowercased() }
-                    if matches.isEmpty {
-                        throw OperationError(code: "checklist_entry_not_found",
-                                             message: "No checklist step matching “\(key)” on item \(item.id).",
-                                             details: ["field": field, "step": key, "item_id": item.id])
-                    }
-                    guard matches.count == 1 else {
-                        throw OperationError(code: "ambiguous_match",
-                                             message: "\(matches.count) checklist steps are titled “\(key)”. Refer to one by id.",
-                                             details: ["field": field, "step": key,
-                                                       "candidates": matches.map { ["id": $0.id, "title": $0.title] }])
-                    }
-                    id = matches[0].id
-                }
+                let id = try existing(field, key)
                 if !ids.contains(id) { ids.append(id) }
             }
             return ids
         }
-        let check = try resolve("check"), uncheck = try resolve("uncheck"), remove = try resolve("remove")
-        for (first, second, x, y) in [("check", "uncheck", check, uncheck), ("remove", "check", remove, check), ("remove", "uncheck", remove, uncheck)] {
+        let check = try resolve("check"), fail = try resolve("fail"), uncheck = try resolve("uncheck"), remove = try resolve("remove")
+        let exclusive = [("check", "fail", check, fail), ("check", "uncheck", check, uncheck), ("fail", "uncheck", fail, uncheck),
+                     ("remove", "check", remove, check), ("remove", "fail", remove, fail), ("remove", "uncheck", remove, uncheck)]
+        for (first, second, x, y) in exclusive {
             let both = x.filter(y.contains)
             if !both.isEmpty {
                 throw OperationError(code: "contradictory_operations",
@@ -385,7 +385,75 @@ extension OperationService {
             }
         }
 
-        let added = try store.applyChecklist(item.id, .init(add: add, check: check, uncheck: uncheck, remove: remove), author: author)
+        // Links may name existing steps (by id or title) or steps added by this request (by title).
+        typealias Ref = Store.ChecklistChanges.StepRef
+        func linkRef(_ field: String, _ key: String, allowAdded: Bool) throws -> Ref {
+            if item.checklist.contains(where: { $0.id == key }) {
+                guard !remove.contains(key) else { throw removedStep(field, key) }
+                return .existing(key)
+            }
+            let old = item.checklist.filter { $0.title.lowercased() == key.lowercased() && !remove.contains($0.id) }
+            let new = allowAdded ? add.indices.filter { add[$0].lowercased() == key.lowercased() } : []
+            if old.count + new.count > 1 {
+                throw ambiguous(field, key, old.map { ["id": $0.id, "title": $0.title] } + new.map { ["added": $0, "title": add[$0]] })
+            }
+            if let e = old.first { return .existing(e.id) }
+            if let i = new.first { return .added(i) }
+            if item.checklist.contains(where: { $0.title.lowercased() == key.lowercased() }) { throw removedStep(field, key) }
+            throw notFound(field, key)
+        }
+        func removedStep(_ field: String, _ key: String) -> OperationError {
+            OperationError(code: "contradictory_operations", message: "“\(key)” is removed by the same request, so it can't be linked.",
+                           details: ["fields": ["remove", field], "steps": [key]])
+        }
+        func pairs(_ field: String) throws -> [[String: Any]] {
+            guard let raw = a.raw[field], !(raw is NSNull) else { return [] }
+            guard let list = raw as? [Any], list.allSatisfy({ $0 is [String: Any] }) else {
+                throw OperationError.invalidField(field, "\(field) must be an array of {from, to} objects.")
+            }
+            return try (list as! [[String: Any]]).map { o in
+                guard o["from"] is String, o["to"] is String else {
+                    throw OperationError.invalidField(field, "Each \(field) entry needs string `from` and `to`.")
+                }
+                return o
+            }
+        }
+        var links: [Store.ChecklistChanges.Link] = []
+        for o in try pairs("link") {
+            let raw = o["condition"].flatMap { $0 is NSNull ? nil : $0 }
+            guard raw == nil || raw is String, let condition = raw.map({ LinkCondition(rawValue: $0 as! String) }) ?? .always else {
+                throw OperationError.invalidField("link", "condition must be one of: always, good, bad.",
+                                                  allowed: LinkCondition.allCases.map(\.rawValue))
+            }
+            let link = Store.ChecklistChanges.Link(from: try linkRef("link", o["from"] as! String, allowAdded: true),
+                                                   to: try linkRef("link", o["to"] as! String, allowAdded: true), condition: condition)
+            if let same = links.firstIndex(where: { $0.from == link.from && $0.to == link.to }) {
+                guard links[same].condition == condition else {
+                    throw OperationError(code: "contradictory_operations", message: "The same link is given two different conditions.",
+                                         details: ["fields": ["link"], "steps": [o["from"]!, o["to"]!]])
+                }
+                continue
+            }
+            links.append(link)
+        }
+        var unlink: [(from: String, to: String)] = []
+        for o in try pairs("unlink") {
+            guard case .existing(let from) = try linkRef("unlink", o["from"] as! String, allowAdded: false),
+                  case .existing(let to) = try linkRef("unlink", o["to"] as! String, allowAdded: false) else { continue }
+            guard item.checklist.first(where: { $0.id == to })?.links.contains(where: { $0.from == from }) == true else {
+                throw OperationError(code: "checklist_link_not_found",
+                                     message: "There is no link from “\(o["from"]!)” to “\(o["to"]!)” on item \(item.id).",
+                                     details: ["field": "unlink", "from": from, "to": to, "item_id": item.id])
+            }
+            guard !links.contains(where: { $0.from == .existing(from) && $0.to == .existing(to) }) else {
+                throw OperationError(code: "contradictory_operations", message: "The same link can't be in both link and unlink.",
+                                     details: ["fields": ["link", "unlink"], "steps": [from, to]])
+            }
+            if !unlink.contains(where: { $0 == (from, to) }) { unlink.append((from, to)) }
+        }
+
+        let changes = Store.ChecklistChanges(add: add, check: check, fail: fail, uncheck: uncheck, remove: remove, link: links, unlink: unlink)
+        let added = try store.applyChecklist(item.id, changes, author: author)
         let saved = try persisted(item.id)
         let p = saved.checklistProgress
         return OperationOutput(

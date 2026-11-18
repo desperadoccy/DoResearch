@@ -7,6 +7,7 @@ struct ItemDetailView: View {
     @Environment(AppState.self) private var app
     @State private var tagText = ""
     @State private var newChecklistTitle = ""
+    @AppStorage("checklistGraphMode") private var checklistGraphMode = false
     @State private var newNote = ""
     @State private var confirmingDelete = false
 
@@ -348,8 +349,74 @@ struct ItemDetailView: View {
 
     private func checklistSection(_ item: Item) -> some View {
         Section {
-            ForEach(item.checklist) { entry in
+            if checklistGraphMode {
+                if item.checklist.isEmpty {
+                    Text("Add steps below, then drag from a step's handle onto another to set the order.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ChecklistGraphView(item: item)
+                }
+            } else {
+                checklistRows(item)
+            }
+            TextField("Add step", text: $newChecklistTitle, prompt: Text("Add a step and press Return"))
+                .onSubmit {
+                    let t = newChecklistTitle.trimmingCharacters(in: .whitespaces)
+                    guard !t.isEmpty else { return }
+                    store.addChecklistEntry(to: itemID, title: t)
+                    newChecklistTitle = ""
+                }
+        } header: {
+            HStack {
+                Text(item.kind == .coding ? "Implementation Steps" : "Checklist")
+                Spacer()
+                let p = item.checklistProgress
+                if p.total > 0 {
+                    ProgressView(value: Double(p.done), total: Double(p.total))
+                        .frame(width: 80)
+                        .controlSize(.small)
+                    Text("\(p.done)/\(p.total)").monospacedDigit()
+                }
+                if checklistGraphMode, p.total > 1 {
+                    Button {
+                        store.placeChecklistEntries(ChecklistGraphView.layout(item, keepingPlaced: false), in: item.id)
+                    } label: {
+                        Image(systemName: "wand.and.rays")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Auto arrange by dependencies")
+                }
+                Picker("View", selection: $checklistGraphMode) {
+                    Image(systemName: "list.bullet").tag(false).help("List")
+                    Image(systemName: "point.3.connected.trianglepath.dotted").tag(true).help("Graph")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+            }
+        }
+    }
+
+    /// Steps in dependency order; a lock marks steps still waiting on earlier ones.
+    @ViewBuilder
+    private func checklistRows(_ item: Item) -> some View {
+            ForEach(item.checklistInGraphOrder) { entry in
                 HStack {
+                    if !entry.done, item.isBlocked(entry) {
+                        Image(systemName: "lock")
+                            .foregroundStyle(.tertiary)
+                            .help("Waiting on: " + entry.prerequisites.compactMap { l in item.checklist.first { $0.id == l.from }?.title }
+                                .joined(separator: ", "))
+                    } else if item.isSkipped(entry) {
+                        Image(systemName: "minus.circle")
+                            .foregroundStyle(.tertiary)
+                            .help("Not on the path taken")
+                    } else if entry.done, entry.failed {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .help("Done — it went badly")
+                    }
                     Toggle(isOn: Binding(
                         get: { entry.done },
                         set: { var e = entry; e.done = $0; store.updateChecklistEntry(e) }
@@ -372,26 +439,6 @@ struct ItemDetailView: View {
                     .buttonStyle(.borderless)
                 }
             }
-            TextField("Add step", text: $newChecklistTitle, prompt: Text("Add a step and press Return"))
-                .onSubmit {
-                    let t = newChecklistTitle.trimmingCharacters(in: .whitespaces)
-                    guard !t.isEmpty else { return }
-                    store.addChecklistEntry(to: itemID, title: t)
-                    newChecklistTitle = ""
-                }
-        } header: {
-            HStack {
-                Text(item.kind == .coding ? "Implementation Steps" : "Checklist")
-                Spacer()
-                let p = item.checklistProgress
-                if p.total > 0 {
-                    ProgressView(value: Double(p.done), total: Double(p.total))
-                        .frame(width: 80)
-                        .controlSize(.small)
-                    Text("\(p.done)/\(p.total)").monospacedDigit()
-                }
-            }
-        }
     }
 
     // MARK: Activity
