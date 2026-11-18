@@ -131,6 +131,53 @@ struct ToolHarness {
         expect(copy != nil && copy!.id != c.id && copy!.projectID == proj2.id && s2.item(c.id)!.projectID == nil, "copy goes to project, original stays")
         expect(copy?.checklist.first?.done == true, "copy keeps checklist state")
 
+        // Checklist graph: edges, cycle rejection, dependency order, positions, and copies.
+        let g = s2.createItem(Item(id: "", title: "graph"), checklist: ["write", "run", "plan"])
+        let gw = g.checklist[0].id, gr = g.checklist[1].id, gp = g.checklist[2].id
+        expect(s2.linkChecklist(from: gp, to: gw, in: g.id) && s2.linkChecklist(from: gw, to: gr, in: g.id), "link plan → write → run")
+        expect(!s2.linkChecklist(from: gp, to: gw, in: g.id), "duplicate link rejected")
+        expect(s2.item(g.id)!.checklistInGraphOrder.map(\.title) == ["plan", "write", "run"], "list follows dependency order")
+        expect(s2.item(g.id)!.isBlocked(s2.item(g.id)!.checklist[1]), "run is blocked until write is done")
+        s2.moveChecklistEntry(gr, in: g.id, to: CGPoint(x: 300, y: 80))
+        s2.unlinkChecklist(from: gw, to: gr, in: g.id)
+        expect(s2.item(g.id)!.checklist.first { $0.id == gr }!.after.isEmpty && Store(url: url2).item(g.id)!.checklist.first { $0.id == gr }!.after.isEmpty,
+               "unlink removes the edge in memory and on disk")
+        expect(s2.linkChecklist(from: gw, to: gr, in: g.id), "edge can be added back after removal")
+        let gReopened = Store(url: url2).item(g.id)!.checklist.first { $0.id == gr }!
+        expect(gReopened.after == [gw] && gReopened.x == 300 && gReopened.y == 80, "edges and positions persist")
+        let gcopy = s2.item(s2.duplicate([g.id]).first)!
+        let copyRun = gcopy.checklist.first { $0.title == "run" }!, copyWrite = gcopy.checklist.first { $0.title == "write" }!
+        expect(copyRun.after == [copyWrite.id] && copyRun.x == 300 && copyRun.id != gr, "duplicate keeps edges (remapped) and positions")
+        s2.removeChecklistEntry(s2.item(g.id)!.checklist[0])
+        expect(s2.item(g.id)!.checklist.allSatisfy { $0.after.isEmpty }, "removing a step drops its edges")
+        s2.unlinkChecklist(from: gp, to: gw, in: g.id)
+
+        // Branches and loops: run → (went well) report, (went badly) tune → back to run.
+        let bx = s2.createItem(Item(id: "", title: "branches"), checklist: ["run", "report", "tune"])
+        let br = bx.checklist[0].id, bp = bx.checklist[1].id, bt = bx.checklist[2].id
+        func step(_ id: String) -> ChecklistEntry { s2.item(bx.id)!.checklist.first { $0.id == id }! }
+        expect(s2.linkChecklist(from: br, to: bp, in: bx.id, condition: .good) && s2.linkChecklist(from: br, to: bt, in: bx.id, condition: .bad),
+               "conditional links added")
+        expect(s2.wouldLoop(from: bt, to: br, in: bx.id) && s2.linkChecklist(from: bt, to: br, in: bx.id), "link back to an earlier step becomes a loop")
+        expect(step(br).links.first?.loop == true && !s2.item(bx.id)!.isBlocked(step(br)), "loop link never blocks")
+        expect(s2.item(bx.id)!.checklistInGraphOrder.map(\.title) == ["run", "report", "tune"], "order ignores loop links")
+        var r = step(br); r.done = true; r.failed = true; s2.updateChecklistEntry(r)
+        expect(s2.item(bx.id)!.isSkipped(step(bp)) && !s2.item(bx.id)!.isSkipped(step(bt)), "went badly: well-branch skipped, bad-branch open")
+        var t = step(bt); t.done = true; s2.updateChecklistEntry(t)
+        expect(!step(br).done && !step(bt).done && !step(br).failed, "finishing the loop step reopens the round")
+        expect(s2.logs(forItem: bx.id).contains { $0.text.hasPrefix("Loop back to “run”") }, "loop is logged")
+        r = step(br); r.done = true; s2.updateChecklistEntry(r)
+        expect(s2.item(bx.id)!.isSkipped(step(bt)) && !s2.item(bx.id)!.isSkipped(step(bp)), "went well: bad-branch skipped")
+        s2.setLinkCondition(from: br, to: bt, in: bx.id, .always)
+        expect(!s2.item(bx.id)!.isSkipped(step(bt)), "condition change takes effect")
+        expect(s2.linkChecklist(from: bp, to: bp, in: bx.id) && step(bp).links.first { $0.from == bp }?.loop == true, "self link is a loop")
+        let bReopened = Store(url: url2).item(bx.id)!
+        func reread(_ id: String) -> ChecklistEntry { bReopened.checklist.first { $0.id == id }! }
+        let runLoop: Bool = reread(br).links.first?.loop == true
+        let tuneAlways: Bool = reread(bt).links.first?.condition == .always
+        let reportGood: Bool = reread(bp).links.first { $0.from == br }?.condition == .good
+        expect(runLoop && tuneAlways && reportGood, "conditions and loops persist")
+
         // Today placement triages inbox items.
         let inboxItem = s2.createItem(Item(id: "", title: "triage me", status: .inbox))
         s2.place([inboxItem], copy: false, placement: SidebarSelection.today.placement, before: nil, within: nil)

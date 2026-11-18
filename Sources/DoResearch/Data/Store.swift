@@ -32,9 +32,17 @@ final class Store {
         do {
             projects = try db.query("SELECT * FROM projects ORDER BY created_at").map(Self.project(from:))
             let checklistRows = try db.query("SELECT * FROM checklist ORDER BY position, rowid")
+            var links: [String: [ChecklistLink]] = [:]
+            for row in try db.query("SELECT * FROM checklist_edges ORDER BY rowid") {
+                guard let from = row["from_id"]?.string, let to = row["to_id"]?.string else { continue }
+                links[to, default: []].append(ChecklistLink(
+                    from: from, condition: LinkCondition(rawValue: row["condition"]?.string ?? "") ?? .always,
+                    loop: (row["loop"]?.int ?? 0) != 0))
+            }
             var byItem: [String: [ChecklistEntry]] = [:]
             for row in checklistRows {
-                let e = Self.checklist(from: row)
+                var e = Self.checklist(from: row)
+                e.links = links[e.id] ?? []
                 byItem[e.itemID, default: []].append(e)
             }
             items = try db.query("SELECT * FROM items").map { row in
@@ -125,7 +133,11 @@ final class Store {
         if !item.status.isOpen, item.completedAt == nil { item.completedAt = now }
         if item.status.isOpen { item.completedAt = nil }
         if item.kind == .experiment, item.status == .inProgress, item.runStartedAt == nil { item.runStartedAt = now }
-        let steps = checklist.isEmpty ? draft.checklist.map { ($0.title, $0.done) } : checklist.map { ($0, false) }
+        // Duplicates keep their steps' state, graph positions, and edges (remapped to the new step ids).
+        let source = checklist.isEmpty ? draft.checklist
+            : checklist.enumerated().map { ChecklistEntry(id: "", itemID: "", title: $1, done: false, position: $0) }
+        let newIDs = source.map { _ in ShortID.make(10) }
+        let idMap = Dictionary(source.enumerated().map { ($1.id, newIDs[$0]) }, uniquingKeysWith: { a, _ in a })
         item.checklist = []
         let text = logText ?? "Created \(item.kind.label.lowercased()) “\(item.title)”"
         try db.transaction {
@@ -133,10 +145,17 @@ final class Store {
                 "INSERT INTO items (\(Self.itemColumns.joined(separator: ","))) VALUES (\(Self.placeholders(Self.itemColumns.count)))",
                 Self.itemParams(item)
             )
-            for (i, step) in steps.enumerated() {
-                let entry = ChecklistEntry(id: ShortID.make(10), itemID: item.id, title: step.0, done: step.1, position: i)
+            for (i, step) in source.enumerated() {
+                let links = step.links.compactMap { l in idMap[l.from].map { ChecklistLink(from: $0, condition: l.condition, loop: l.loop) } }
+                let entry = ChecklistEntry(id: newIDs[i], itemID: item.id, title: step.title, done: step.done, position: i,
+                                           failed: step.done && step.failed, x: step.x, y: step.y, links: links)
                 try insertChecklist(entry)
                 item.checklist.append(entry)
+            }
+            for entry in item.checklist {
+                for l in entry.links {
+                    try insertLink(l, to: entry.id)
+                }
             }
             try writeLog(item: item.id, project: item.projectID, kind: "created", text: text, author: author)
         }
@@ -412,8 +431,122 @@ final class Store {
     // MARK: Checklist
 
     private func insertChecklist(_ e: ChecklistEntry) throws {
-        try db.execute("INSERT INTO checklist (id, item_id, title, done, position) VALUES (?,?,?,?,?)",
-                       [e.id, e.itemID, e.title, e.done, e.position])
+        try db.execute("INSERT INTO checklist (id, item_id, title, done, position, x, y, failed) VALUES (?,?,?,?,?,?,?,?)",
+                       [e.id, e.itemID, e.title, e.done, e.position, e.x, e.y, e.failed])
+    }
+
+    private func insertLink(_ l: ChecklistLink, to: String) throws {
+        try db.execute("INSERT OR IGNORE INTO checklist_edges (from_id, to_id, condition, loop) VALUES (?,?,?,?)",
+                       [l.from, to, l.condition.rawValue, l.loop])
+    }
+
+    // MARK: Checklist graph
+
+    /// Saves where a step sits on the checklist graph. Layout only: the item's revision and log are untouched.
+    func moveChecklistEntry(_ entryID: String, in itemID: String, to point: CGPoint) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              let ci = items[index].checklist.firstIndex(where: { $0.id == entryID }) else { return }
+        do {
+            try db.execute("UPDATE checklist SET x = ?, y = ? WHERE id = ?", [Double(point.x), Double(point.y), entryID])
+            items[index].checklist[ci].x = point.x
+            items[index].checklist[ci].y = point.y
+        } catch {
+            report(error)
+        }
+    }
+
+    /// Saves graph positions for several steps at once (e.g. after auto-arranging).
+    func placeChecklistEntries(_ points: [String: CGPoint], in itemID: String) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
+        do {
+            try db.transaction {
+                for (id, p) in points {
+                    try db.execute("UPDATE checklist SET x = ?, y = ? WHERE id = ?", [Double(p.x), Double(p.y), id])
+                }
+            }
+            for i in items[index].checklist.indices {
+                if let p = points[items[index].checklist[i].id] {
+                    items[index].checklist[i].x = p.x
+                    items[index].checklist[i].y = p.y
+                }
+            }
+        } catch {
+            report(error)
+        }
+    }
+
+    /// Whether `from → to` can be added: both steps exist and the link isn't there yet. Any link is allowed;
+    /// one that closes a cycle (including a step to itself) becomes a loop link.
+    func canLinkChecklist(from: String, to: String, in itemID: String) -> Bool {
+        guard let item = item(itemID),
+              let target = item.checklist.first(where: { $0.id == to }),
+              item.checklist.contains(where: { $0.id == from }) else { return false }
+        return !target.after.contains(from)
+    }
+
+    /// Whether `from → to` would point back to `from` or an earlier step, and so be a loop link.
+    func wouldLoop(from: String, to: String, in itemID: String) -> Bool {
+        guard let item = item(itemID) else { return false }
+        return from == to || Self.checklistReaches(from: to, to: from, in: item.checklist)
+    }
+
+    /// Adds the link `from → to`: `from` comes first. A link back to an earlier step is stored as a loop.
+    @discardableResult
+    func linkChecklist(from: String, to: String, in itemID: String, condition: LinkCondition = .always,
+                       author: Author = .user) -> Bool {
+        guard canLinkChecklist(from: from, to: to, in: itemID),
+              let index = items.firstIndex(where: { $0.id == itemID }),
+              let ti = items[index].checklist.firstIndex(where: { $0.id == to }) else { return false }
+        let link = ChecklistLink(from: from, condition: condition, loop: wouldLoop(from: from, to: to, in: itemID))
+        do {
+            try insertLink(link, to: to)
+            items[index].checklist[ti].links.append(link)
+            touch(index)
+            return true
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
+    /// Changes when the link `from → to` is followed.
+    func setLinkCondition(from: String, to: String, in itemID: String, _ condition: LinkCondition) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              let ti = items[index].checklist.firstIndex(where: { $0.id == to }),
+              let li = items[index].checklist[ti].links.firstIndex(where: { $0.from == from }),
+              items[index].checklist[ti].links[li].condition != condition else { return }
+        do {
+            try db.execute("UPDATE checklist_edges SET condition = ? WHERE from_id = ? AND to_id = ?", [condition.rawValue, from, to])
+            items[index].checklist[ti].links[li].condition = condition
+            touch(index)
+        } catch {
+            report(error)
+        }
+    }
+
+    func unlinkChecklist(from: String, to: String, in itemID: String) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              let ti = items[index].checklist.firstIndex(where: { $0.id == to }) else { return }
+        do {
+            try db.execute("DELETE FROM checklist_edges WHERE from_id = ? AND to_id = ?", [from, to])
+            items[index].checklist[ti].links.removeAll { $0.from == from }
+            touch(index)
+        } catch {
+            report(error)
+        }
+    }
+
+    /// Whether `to` is reachable from `from` following forward (non-loop) links.
+    static func checklistReaches(from: String, to: String, in list: [ChecklistEntry]) -> Bool {
+        var next: [String: [String]] = [:]
+        for e in list { for l in e.prerequisites { next[l.from, default: []].append(e.id) } }
+        var stack = [from], seen: Set<String> = []
+        while let n = stack.popLast() {
+            if n == to { return true }
+            guard seen.insert(n).inserted else { continue }
+            stack.append(contentsOf: next[n] ?? [])
+        }
+        return false
     }
 
     @discardableResult
@@ -436,17 +569,52 @@ final class Store {
         guard let index = items.firstIndex(where: { $0.id == entry.itemID }),
               let ci = items[index].checklist.firstIndex(where: { $0.id == entry.id }) else { return }
         let old = items[index].checklist[ci]
+        var entry = entry
+        if !entry.done { entry.failed = false }
         do {
-            try db.execute("UPDATE checklist SET title = ?, done = ? WHERE id = ?", [entry.title, entry.done, entry.id])
+            try db.execute("UPDATE checklist SET title = ?, done = ?, failed = ? WHERE id = ?",
+                           [entry.title, entry.done, entry.failed, entry.id])
             items[index].checklist[ci] = entry
             touch(index)
-            if old.done != entry.done, entry.done {
+            if entry.done, !old.done || old.failed != entry.failed {
                 let p = items[index].checklistProgress
                 log(item: entry.itemID, project: items[index].projectID, kind: "update",
-                    text: "Checked “\(entry.title)” (\(p.done)/\(p.total))", author: author)
+                    text: "Checked “\(entry.title)”\(entry.failed ? " — didn't work out" : "") (\(p.done)/\(p.total))",
+                    author: author)
+                try followLoops(from: entry.id, at: index, author: author)
             }
         } catch {
             report(error)
+        }
+    }
+
+    /// After `stepID` is finished, follows every loop link leaving it whose condition matches its result: the loop's
+    /// target, this step, and every step on a forward path between them are reopened for another round.
+    private func followLoops(from stepID: String, at index: Int, author: Author) throws {
+        let list = items[index].checklist
+        guard let step = list.first(where: { $0.id == stepID }) else { return }
+        let targets = list.filter { e in
+            e.links.contains { $0.loop && $0.from == stepID && ChecklistEntry.taken($0, done: step.done, failed: step.failed) }
+        }
+        guard !targets.isEmpty else { return }
+        var reopen: Set<String> = [stepID]
+        for t in targets {
+            reopen.insert(t.id)
+            for e in list where Self.checklistReaches(from: t.id, to: e.id, in: list)
+                && Self.checklistReaches(from: e.id, to: stepID, in: list) {
+                reopen.insert(e.id)
+            }
+        }
+        let ids = list.filter { reopen.contains($0.id) && $0.done }.map(\.id)
+        try db.transaction {
+            for id in ids { try db.execute("UPDATE checklist SET done = 0, failed = 0 WHERE id = ?", [id]) }
+            try writeLog(item: items[index].id, project: items[index].projectID, kind: "update",
+                         text: "Loop back to " + targets.map { "“\($0.title)”" }.joined(separator: ", ")
+                            + ": reopened \(ids.count) step\(ids.count == 1 ? "" : "s")", author: author)
+        }
+        for i in items[index].checklist.indices where ids.contains(items[index].checklist[i].id) {
+            items[index].checklist[i].done = false
+            items[index].checklist[i].failed = false
         }
     }
 
@@ -455,6 +623,7 @@ final class Store {
         do {
             try db.execute("DELETE FROM checklist WHERE id = ?", [entry.id])
             items[index].checklist.removeAll { $0.id == entry.id }
+            for i in items[index].checklist.indices { items[index].checklist[i].links.removeAll { $0.from == entry.id } }
             touch(index)
         } catch {
             report(error)
@@ -487,13 +656,15 @@ final class Store {
                 try db.execute("DELETE FROM checklist WHERE id = ?", [id])
                 other.append("removed “\(list[i].title)”")
                 list.remove(at: i)
+                for j in list.indices { list[j].links.removeAll { $0.from == id } }
             }
             for (ids, done) in [(changes.check, true), (changes.uncheck, false)] {
                 for id in ids {
                     guard let i = list.firstIndex(where: { $0.id == id }) else { throw DatabaseError(message: "No checklist step \(id)") }
                     guard list[i].done != done else { continue }
-                    try db.execute("UPDATE checklist SET done = ? WHERE id = ?", [done, id])
+                    try db.execute("UPDATE checklist SET done = ?, failed = 0 WHERE id = ?", [done, id])
                     list[i].done = done
+                    list[i].failed = false
                     if done { checked.append(list[i].title) } else { other.append("unchecked “\(list[i].title)”") }
                 }
             }
@@ -828,7 +999,8 @@ final class Store {
 
     private static func checklist(from r: Row) -> ChecklistEntry {
         ChecklistEntry(id: r["id"]?.string ?? "", itemID: r["item_id"]?.string ?? "", title: r["title"]?.string ?? "",
-                       done: (r["done"]?.int ?? 0) != 0, position: r["position"]?.int ?? 0)
+                       done: (r["done"]?.int ?? 0) != 0, position: r["position"]?.int ?? 0,
+                       failed: (r["failed"]?.int ?? 0) != 0, x: r["x"]?.double, y: r["y"]?.double)
     }
 
     private static func project(from r: Row) -> Project {
