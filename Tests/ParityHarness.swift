@@ -200,6 +200,55 @@ enum ParityHarness {
             Step(name: "list_projects", args: ["type": "personal", "include_archived": true], what: "list projects by type"),
             Step(name: "review_summary", args: ["days": 7], check: { result($0)["created_count"] as? Int == 3 }, what: "review summary"),
 
+            // 2b. Checklist graph: links (including to steps added in the same request), branches, loops
+            Step(name: "create_item", args: ["title": "Tune until it works", "kind": "experiment", "checklist": ["train"]],
+                 save: ["loopy": ["result", "item", "id"], "train": ["result", "item", "checklist", 0, "id"]], what: "item for graph checks"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "add": ["evaluate", "tune", "write up"], "link": [
+                ["from": "$train", "to": "evaluate"],
+                ["from": "evaluate", "to": "write up", "condition": "good"],
+                ["from": "evaluate", "to": "tune", "condition": "bad"],
+                ["from": "tune", "to": "train"],
+            ]], save: ["evaluate": ["result", "added", 0, "id"], "tune": ["result", "added", 1, "id"]],
+                 check: {
+                     let list = result($0)["checklist"] as? [[String: Any]] ?? []
+                     func after(_ t: String) -> [[String: Any]] { list.first { $0["title"] as? String == t }?["after"] as? [[String: Any]] ?? [] }
+                     return after("evaluate").first?["loop"] as? Bool == false
+                         && after("write up").first?["condition"] as? String == "good"
+                         && after("tune").first?["condition"] as? String == "bad"
+                         && after("train").first?["loop"] as? Bool == true && after("train").first?["id"] as? String == list.first { $0["title"] as? String == "tune" }?["id"] as? String
+                 }, what: "link new and existing steps; a link back becomes a loop"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "check": ["train"], "fail": ["$evaluate"]],
+                 check: {
+                     let list = result($0)["checklist"] as? [[String: Any]] ?? []
+                     return list.map { $0["done"] as? Bool } == [true, true, false, false] && list[1]["failed"] as? Bool == true
+                 }, what: "fail marks done with the bad result"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "check": ["tune"]],
+                 check: {
+                     let list = result($0)["checklist"] as? [[String: Any]] ?? []
+                     return list.allSatisfy { $0["done"] as? Bool == false && $0["failed"] as? Bool == false }
+                 }, what: "finishing the loop step reopens the round"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "link": [["from": "evaluate", "to": "tune", "condition": "always"]],
+                                                  "unlink": [["from": "tune", "to": "$train"]]],
+                 check: {
+                     let list = result($0)["checklist"] as? [[String: Any]] ?? []
+                     func after(_ t: String) -> [[String: Any]] { list.first { $0["title"] as? String == t }?["after"] as? [[String: Any]] ?? [] }
+                     return after("tune").first?["condition"] as? String == "always" && after("train").isEmpty
+                 }, what: "re-link changes the condition; unlink removes"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "link": [["from": "evaluate", "to": "tune", "condition": "always"]]],
+                 check: { result($0)["changed"] as? Bool == false }, what: "linking an identical pair changes nothing"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "unlink": [["from": "tune", "to": "train"]]],
+                 error: "checklist_link_not_found", what: "unlinking a missing link rejected"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "link": [["from": "train", "to": "nope"]]],
+                 error: "checklist_entry_not_found", what: "link to an unknown step rejected"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "link": [["from": "train", "to": "tune", "condition": "maybe"]]],
+                 error: "invalid_field", what: "unknown condition rejected"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "remove": ["tune"], "link": [["from": "train", "to": "tune"]]],
+                 error: "contradictory_operations", what: "linking a step removed in the same request rejected"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "check": ["train"], "fail": ["train"]],
+                 error: "contradictory_operations", what: "check and fail on the same step rejected"),
+            Step(name: "update_checklist", args: ["item_id": "$loopy", "add": ["tune"], "link": [["from": "train", "to": "tune"]]],
+                 error: "ambiguous_match", what: "title matching an existing and a new step is ambiguous"),
+
             // Structured errors, all-or-nothing
             Step(name: "update_checklist", args: ["item_id": "$exp", "add": ["dup", "dup"]], what: "add duplicate titles"),
             Step(name: "update_checklist", args: ["item_id": "$exp", "check": ["dup"]], error: "ambiguous_match", what: "ambiguous title rejected"),

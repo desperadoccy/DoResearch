@@ -100,14 +100,24 @@ enum OperationRegistry {
             run: { try $0.updateItem($1, $2) }),
         Operation(
             name: "update_checklist",
-            description: "Add, check, uncheck, or remove checklist steps of an item, all or nothing. Steps are matched by id, or by exact title (case-insensitive) when the title is unique. New steps are appended in order.",
+            description: "Change an item's checklist, all or nothing: add, check, fail, uncheck, or remove steps, and link them into a graph. Steps are matched by id, or by exact title (case-insensitive) when the title is unique; links may also name steps added in the same request. A link says `from` comes before `to`; a link back to an earlier step (or a step to itself) becomes a loop, which never blocks and, when its source is finished with a matching result, reopens the steps from its target back to its source. Conditional links are followed only when their source went well (`good`, set by check) or badly (`bad`, set by fail).",
             mutates: true, revisionTarget: .item("item_id"),
             input: Schema.object([
                 "item_id": Schema.string("Item id."),
                 "add": Schema.array(Schema.string(), "New step titles to append."),
-                "check": Schema.array(Schema.string(), "Steps to mark done (ids or titles)."),
+                "check": Schema.array(Schema.string(), "Steps to mark done, with the result “went well” (ids or titles)."),
+                "fail": Schema.array(Schema.string(), "Steps to mark done, with the result “went badly” (ids or titles)."),
                 "uncheck": Schema.array(Schema.string(), "Steps to mark not done (ids or titles)."),
                 "remove": Schema.array(Schema.string(), "Steps to delete (ids or titles)."),
+                "link": Schema.array(Schema.object([
+                    "from": Schema.string("The step that comes first (id or title)."),
+                    "to": Schema.string("The step that follows (id or title)."),
+                    "condition": Schema.choice(LinkCondition.allCases.map(\.rawValue),
+                                               "When the link is followed. Default always. Re-linking an existing pair changes its condition."),
+                ], required: ["from", "to"]), "Links to add, or whose condition to change."),
+                "unlink": Schema.array(Schema.object([
+                    "from": Schema.string("Id or title."), "to": Schema.string("Id or title."),
+                ]), "Links to remove."),
             ], required: ["item_id"]),
             output: Schema.object([
                 "item_id": Schema.string(), "revision": Schema.integer(), "changed": Schema.boolean(),

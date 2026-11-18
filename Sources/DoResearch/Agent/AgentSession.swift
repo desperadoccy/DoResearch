@@ -216,6 +216,11 @@ final class AgentSession {
     inbox means not yet triaged; dropped replaces deletion.
     - Experiments carry hypothesis, setup, compute, run times, metrics, results, an outcome (pending/supported/refuted/\
     inconclusive/failed), and a conclusion. Coding items carry repo, branch, a PR/issue link, and a checklist of implementation steps.
+    - Checklist steps can be linked into a graph with update_checklist: a link says one step comes before another, and may \
+    be followed only if the earlier step went well (condition good, set with check) or badly (condition bad, set with fail). \
+    A link back to an earlier step is a loop: finishing its source with a matching result reopens that round. Use links \
+    when the user describes a plan that depends on results ("if the baseline works, write it up; otherwise tune and rerun"), \
+    and use fail when they report that a step didn't work out.
     - Any item can track a measurable count toward a target (progress_target, progress_unit), e.g. "read 10 papers" is one \
     item at 0/10 papers. When the user reports progress on such work ("read two more"), use progress_add on the existing \
     item rather than creating new items. Reaching the target marks it done.

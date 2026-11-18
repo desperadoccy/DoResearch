@@ -32,13 +32,7 @@ final class Store {
         do {
             projects = try db.query("SELECT * FROM projects ORDER BY created_at").map(Self.project(from:))
             let checklistRows = try db.query("SELECT * FROM checklist ORDER BY position, rowid")
-            var links: [String: [ChecklistLink]] = [:]
-            for row in try db.query("SELECT * FROM checklist_edges ORDER BY rowid") {
-                guard let from = row["from_id"]?.string, let to = row["to_id"]?.string else { continue }
-                links[to, default: []].append(ChecklistLink(
-                    from: from, condition: LinkCondition(rawValue: row["condition"]?.string ?? "") ?? .always,
-                    loop: (row["loop"]?.int ?? 0) != 0))
-            }
+            let links = try Self.links(from: db.query("SELECT * FROM checklist_edges ORDER BY rowid"))
             var byItem: [String: [ChecklistEntry]] = [:]
             for row in checklistRows {
                 var e = Self.checklist(from: row)
@@ -235,8 +229,26 @@ final class Store {
     func storedItem(_ id: String) throws -> Item? {
         guard let row = try db.query("SELECT * FROM items WHERE id = ?", [id]).first else { return nil }
         var item = Self.item(from: row)
-        item.checklist = try db.query("SELECT * FROM checklist WHERE item_id = ? ORDER BY position, rowid", [id]).map(Self.checklist(from:))
+        let links = try Self.links(from: db.query(
+            "SELECT e.* FROM checklist_edges e JOIN checklist c ON c.id = e.to_id WHERE c.item_id = ? ORDER BY e.rowid", [id]))
+        item.checklist = try db.query("SELECT * FROM checklist WHERE item_id = ? ORDER BY position, rowid", [id]).map { row in
+            var e = Self.checklist(from: row)
+            e.links = links[e.id] ?? []
+            return e
+        }
         return item
+    }
+
+    /// Incoming links keyed by the step they point to.
+    private static func links(from rows: [Row]) -> [String: [ChecklistLink]] {
+        var out: [String: [ChecklistLink]] = [:]
+        for row in rows {
+            guard let from = row["from_id"]?.string, let to = row["to_id"]?.string else { continue }
+            out[to, default: []].append(ChecklistLink(
+                from: from, condition: LinkCondition(rawValue: row["condition"]?.string ?? "") ?? .always,
+                loop: (row["loop"]?.int ?? 0) != 0))
+        }
+        return out
     }
 
     /// Moves a tracked count by `delta` (never below zero; it may pass the target).
@@ -536,6 +548,27 @@ final class Store {
         }
     }
 
+    /// The loops taken when `stepID` has just been finished: their targets, and the done steps to reopen (the targets,
+    /// the step itself, and every step on a forward path between them). `nil` if no loop leaving it matches its result.
+    static func loopReopen(after stepID: String, in list: [ChecklistEntry]) -> (targets: [ChecklistEntry], reopen: [String], logText: String)? {
+        guard let step = list.first(where: { $0.id == stepID }) else { return nil }
+        let targets = list.filter { e in
+            e.links.contains { $0.loop && $0.from == stepID && ChecklistEntry.taken($0, done: step.done, failed: step.failed) }
+        }
+        guard !targets.isEmpty else { return nil }
+        var reopen: Set<String> = [stepID]
+        for t in targets {
+            reopen.insert(t.id)
+            for e in list where checklistReaches(from: t.id, to: e.id, in: list) && checklistReaches(from: e.id, to: stepID, in: list) {
+                reopen.insert(e.id)
+            }
+        }
+        let ids = list.filter { reopen.contains($0.id) && $0.done }.map(\.id)
+        let text = "Loop back to " + targets.map { "“\($0.title)”" }.joined(separator: ", ")
+            + ": reopened \(ids.count) step\(ids.count == 1 ? "" : "s")"
+        return (targets, ids, text)
+    }
+
     /// Whether `to` is reachable from `from` following forward (non-loop) links.
     static func checklistReaches(from: String, to: String, in list: [ChecklistEntry]) -> Bool {
         var next: [String: [String]] = [:]
@@ -591,26 +624,11 @@ final class Store {
     /// After `stepID` is finished, follows every loop link leaving it whose condition matches its result: the loop's
     /// target, this step, and every step on a forward path between them are reopened for another round.
     private func followLoops(from stepID: String, at index: Int, author: Author) throws {
-        let list = items[index].checklist
-        guard let step = list.first(where: { $0.id == stepID }) else { return }
-        let targets = list.filter { e in
-            e.links.contains { $0.loop && $0.from == stepID && ChecklistEntry.taken($0, done: step.done, failed: step.failed) }
-        }
-        guard !targets.isEmpty else { return }
-        var reopen: Set<String> = [stepID]
-        for t in targets {
-            reopen.insert(t.id)
-            for e in list where Self.checklistReaches(from: t.id, to: e.id, in: list)
-                && Self.checklistReaches(from: e.id, to: stepID, in: list) {
-                reopen.insert(e.id)
-            }
-        }
-        let ids = list.filter { reopen.contains($0.id) && $0.done }.map(\.id)
+        guard let loop = Self.loopReopen(after: stepID, in: items[index].checklist) else { return }
+        let ids = loop.reopen
         try db.transaction {
             for id in ids { try db.execute("UPDATE checklist SET done = 0, failed = 0 WHERE id = ?", [id]) }
-            try writeLog(item: items[index].id, project: items[index].projectID, kind: "update",
-                         text: "Loop back to " + targets.map { "“\($0.title)”" }.joined(separator: ", ")
-                            + ": reopened \(ids.count) step\(ids.count == 1 ? "" : "s")", author: author)
+            try writeLog(item: items[index].id, project: items[index].projectID, kind: "update", text: loop.logText, author: author)
         }
         for i in items[index].checklist.indices where ids.contains(items[index].checklist[i].id) {
             items[index].checklist[i].done = false
@@ -632,14 +650,34 @@ final class Store {
 
     /// Checklist changes with every step already resolved to an id of the item's checklist.
     struct ChecklistChanges {
+        /// A step named in a link: one already on the checklist, or one added by the same request (index into `add`).
+        enum StepRef: Hashable {
+            case existing(String)
+            case added(Int)
+        }
+
+        struct Link: Hashable {
+            var from: StepRef
+            var to: StepRef
+            var condition: LinkCondition
+        }
+
         var add: [String] = []
+        /// Mark done; it went well.
         var check: [String] = []
+        /// Mark done; it went badly (follows "if it went badly" links).
+        var fail: [String] = []
         var uncheck: [String] = []
         var remove: [String] = []
+        /// Links to add, or whose condition to change if they exist. Applied in order after `unlink`.
+        var link: [Link] = []
+        var unlink: [(from: String, to: String)] = []
     }
 
-    /// Applies a batch of checklist changes in one transaction: removals, then checks and unchecks, then additions
-    /// appended in order. The item's revision moves once, and only if something changed. Returns the added entries.
+    /// Applies a batch of checklist changes in one transaction: removals, results (check / fail / uncheck), additions
+    /// appended in order, unlinks, then links. A link back to an earlier step becomes a loop. Steps finished by the
+    /// request then follow their matching loops. The item's revision moves once, and only if something changed.
+    /// Returns the added entries.
     @discardableResult
     func applyChecklist(_ itemID: String, _ changes: ChecklistChanges, author: Author) throws -> [ChecklistEntry] {
         guard let index = items.firstIndex(where: { $0.id == itemID }) else {
@@ -649,33 +687,78 @@ final class Store {
         var added: [ChecklistEntry] = []
         var checked: [String] = []
         var other: [String] = []
+        var finished: [String] = []
         let now = Date()
+        func position(_ id: String) throws -> Int {
+            guard let i = list.firstIndex(where: { $0.id == id }) else { throw DatabaseError(message: "No checklist step \(id)") }
+            return i
+        }
+        func title(_ id: String) -> String { list.first { $0.id == id }?.title ?? id }
         try db.transaction {
             for id in changes.remove {
-                guard let i = list.firstIndex(where: { $0.id == id }) else { throw DatabaseError(message: "No checklist step \(id)") }
+                let i = try position(id)
                 try db.execute("DELETE FROM checklist WHERE id = ?", [id])
                 other.append("removed “\(list[i].title)”")
                 list.remove(at: i)
                 for j in list.indices { list[j].links.removeAll { $0.from == id } }
             }
-            for (ids, done) in [(changes.check, true), (changes.uncheck, false)] {
+            for (ids, done, failed) in [(changes.check, true, false), (changes.fail, true, true), (changes.uncheck, false, false)] {
                 for id in ids {
-                    guard let i = list.firstIndex(where: { $0.id == id }) else { throw DatabaseError(message: "No checklist step \(id)") }
-                    guard list[i].done != done else { continue }
-                    try db.execute("UPDATE checklist SET done = ?, failed = 0 WHERE id = ?", [done, id])
+                    let i = try position(id)
+                    guard list[i].done != done || list[i].failed != failed else { continue }
+                    try db.execute("UPDATE checklist SET done = ?, failed = ? WHERE id = ?", [done, failed, id])
                     list[i].done = done
-                    list[i].failed = false
-                    if done { checked.append(list[i].title) } else { other.append("unchecked “\(list[i].title)”") }
+                    list[i].failed = failed
+                    if done {
+                        checked.append(list[i].title + (failed ? " — didn't work out" : ""))
+                        finished.append(id)
+                    } else {
+                        other.append("unchecked “\(list[i].title)”")
+                    }
                 }
             }
-            var position = (list.map(\.position).max() ?? -1) + 1
+            var next = (list.map(\.position).max() ?? -1) + 1
             for title in changes.add {
-                let entry = ChecklistEntry(id: ShortID.make(10), itemID: itemID, title: title, done: false, position: position)
-                position += 1
+                let entry = ChecklistEntry(id: ShortID.make(10), itemID: itemID, title: title, done: false, position: next)
+                next += 1
                 try insertChecklist(entry)
                 list.append(entry)
                 added.append(entry)
                 other.append("added “\(title)”")
+            }
+            for u in changes.unlink {
+                let ti = try position(u.to)
+                guard list[ti].links.contains(where: { $0.from == u.from }) else {
+                    throw DatabaseError(message: "No link from \(u.from) to \(u.to)")
+                }
+                try db.execute("DELETE FROM checklist_edges WHERE from_id = ? AND to_id = ?", [u.from, u.to])
+                list[ti].links.removeAll { $0.from == u.from }
+                other.append("unlinked “\(title(u.from))” → “\(title(u.to))”")
+            }
+            for l in changes.link {
+                var ends: [String] = []
+                for ref in [l.from, l.to] {
+                    switch ref {
+                    case .existing(let id): _ = try position(id); ends.append(id)
+                    case .added(let i): ends.append(added[i].id)
+                    }
+                }
+                let from = ends[0], to = ends[1]
+                let ti = try position(to)
+                if let li = list[ti].links.firstIndex(where: { $0.from == from }) {
+                    guard list[ti].links[li].condition != l.condition else { continue }
+                    try db.execute("UPDATE checklist_edges SET condition = ? WHERE from_id = ? AND to_id = ?",
+                                   [l.condition.rawValue, from, to])
+                    list[ti].links[li].condition = l.condition
+                    other.append("“\(title(from))” → “\(title(to))” now \(l.condition.label.lowercased())")
+                    continue
+                }
+                let link = ChecklistLink(from: from, condition: l.condition,
+                                         loop: from == to || Self.checklistReaches(from: to, to: from, in: list))
+                try insertLink(link, to: to)
+                list[ti].links.append(link)
+                let cond = l.condition == .always ? "" : " (\(l.condition.label.lowercased()))"
+                other.append("\(link.loop ? "loop" : "link") “\(title(from))” → “\(title(to))”\(cond)")
             }
             guard !checked.isEmpty || !other.isEmpty else { return }
             try db.execute("UPDATE items SET updated_at = ?, revision = ? WHERE id = ?", [now, items[index].revision + 1, itemID])
@@ -687,6 +770,16 @@ final class Store {
             if author != .user, !other.isEmpty {
                 try writeLog(item: itemID, project: items[index].projectID, kind: "update",
                              text: "Checklist: \(other.joined(separator: ", "))", author: author)
+            }
+            // Loops are followed against the final graph, so a loop added in the same request counts.
+            for id in finished {
+                guard let step = list.first(where: { $0.id == id }), step.done,
+                      let loop = Self.loopReopen(after: id, in: list) else { continue }
+                for rid in loop.reopen {
+                    try db.execute("UPDATE checklist SET done = 0, failed = 0 WHERE id = ?", [rid])
+                    if let i = list.firstIndex(where: { $0.id == rid }) { list[i].done = false; list[i].failed = false }
+                }
+                try writeLog(item: itemID, project: items[index].projectID, kind: "update", text: loop.logText, author: author)
             }
         }
         if !checked.isEmpty || !other.isEmpty {
